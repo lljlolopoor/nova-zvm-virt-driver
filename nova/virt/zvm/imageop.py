@@ -30,7 +30,6 @@ from nova.i18n import _, _LW
 from nova.image import glance
 from nova import utils
 from nova.virt import images
-from nova.virt.zvm import const
 from nova.virt.zvm import exception
 from nova.virt.zvm import utils as zvmutils
 
@@ -42,7 +41,7 @@ QUEUE_BUFFER_SIZE = 10
 class ZVMImages(object):
 
     def __init__(self):
-        self._xcat_url = zvmutils.XCATUrl()
+        self._xcat_url = zvmutils.get_xcat_url()
         self._pathutils = zvmutils.PathUtils()
 
     def create_zvm_image(self, instance, image_name, image_href):
@@ -63,7 +62,7 @@ class ZVMImages(object):
                 raise exception.ZVMImageError(msg=msg)
 
         url = self._xcat_url.imgcapture()
-        LOG.debug('Capturing %s start' % instance['name'])
+        LOG.debug('Capturing %s start', instance['name'])
 
         with zvmutils.except_xcat_call_failed_and_reraise(
                 exception.ZVMImageError):
@@ -92,7 +91,7 @@ class ZVMImages(object):
                 LOG.error(msg)
                 raise exception.ZVMImageError(msg=msg)
         else:
-            msg = _("Capture image returns bad response.")
+            msg = _("Capture image returns bad response. res is %s") % response
             LOG.error(msg)
             raise exception.ZVMImageError(msg=msg)
 
@@ -152,7 +151,7 @@ class ZVMImages(object):
         except (exception.ZVMXCATInternalError,
                 exception.ZVMInvalidXCATResponseDataError,
                 exception.ZVMXCATRequestFailed):
-            LOG.warn(_LW("Failed to delete image file %s from xCAT") %
+            LOG.warning(_LW("Failed to delete image file %s from xCAT"),
                      image_name_xcat)
 
     def _delete_image_object_from_xcat(self, image_name_xcat):
@@ -169,7 +168,7 @@ class ZVMImages(object):
         except (exception.ZVMXCATInternalError,
                 exception.ZVMInvalidXCATResponseDataError,
                 exception.ZVMXCATRequestFailed):
-            LOG.warn(_LW("Failed to delete image definition %s from xCAT") %
+            LOG.warning(_LW("Failed to delete image definition %s from xCAT"),
                      image_name_xcat)
 
     def get_image_file_path_from_image_name(self, image_name_xcat):
@@ -197,9 +196,9 @@ class ZVMImages(object):
         manifest = {}
 
         if os.path.exists(manifest_xml):
-            xml_file = Dom.parse(manifest_xml)
+            xml_file = Dom.parse(manifest_xml)  # nosec
         else:
-            LOG.warn(_LW('manifest.xml does not exist'))
+            LOG.warning(_LW('manifest.xml does not exist'))
             manifest['imagename'] = ''
             manifest['imagetype'] = ''
             manifest['osarch'] = ''
@@ -232,7 +231,7 @@ class ZVMImages(object):
             os.remove(image_bundle)
         else:
             self.clean_up_snapshot_time_path(snapshot_time_path)
-            msg = _("Image bundle does not exist")
+            msg = _("Image bundle does not exist %s") % image_bundle
             raise exception.ZVMImageError(msg=msg)
 
     def get_image_file_name(self, image_package_path):
@@ -241,7 +240,7 @@ class ZVMImages(object):
             for f in file_contents:
                 if f.endswith('.img'):
                     return f
-            msg = _("Can not find image file")
+            msg = _("Can not find image file under %s") % image_package_path
         else:
             msg = _("Image path %s not exist") % image_package_path
         raise exception.ZVMImageError(msg=msg)
@@ -251,7 +250,7 @@ class ZVMImages(object):
         repository.
         """
         LOG.debug("Checking if the image %s exists or not in xCAT "
-                    "MN's image repository " % image_id)
+                    "MN's image repository ", image_id)
         image_uuid = image_id.replace('-', '_')
         parm = '&criteria=profile=~' + image_uuid
         url = self._xcat_url.lsdef_image(addp=parm)
@@ -268,10 +267,10 @@ class ZVMImages(object):
             return False
 
     def fetch_image(self, context, image_id, target, user, project):
-        LOG.debug("Downloading image %s from glance image server" %
+        LOG.debug("Downloading image %s from glance image server",
                   image_id)
         try:
-            images.fetch(context, image_id, target, user, project)
+            images.fetch(context, image_id, target)
         except Exception as err:
             emsg = zvmutils.format_exception_msg(err)
             msg = _("Download image file of image %(id)s failed with reason:"
@@ -327,7 +326,10 @@ class ZVMImages(object):
                     'profile': image_profile,
                     'provmethod': prov_method}
 
-        for item in manifest.keys():
+        if 'image_comments' in image_meta['properties']:
+            manifest['comments'] = image_meta['properties']['image_comments']
+
+        for item in list(manifest.keys()):
             itemkey = doc.createElement(item)
             itemvalue = doc.createTextNode(manifest[item])
             itemkey.appendChild(itemvalue)
@@ -374,7 +376,7 @@ class ZVMImages(object):
         """
         image_bundle_name = image_name + '.tar'
         tar_file = spawn_path + '/' + tmp_file_fn + '_' + image_bundle_name
-        LOG.debug("The generate the image bundle file is %s" % tar_file)
+        LOG.debug("The generate the image bundle file is %s", tar_file)
 
         os.chdir(spawn_path)
         tarFile = tarfile.open(tar_file, mode='w')
@@ -444,7 +446,7 @@ class ZVMImages(object):
         with zvmutils.except_xcat_call_failed_and_reraise(
                 exception.ZVMImageError):
             res = zvmutils.xcat_request("GET", url)
-            with zvmutils.expect_invalid_xcat_resp_data():
+            with zvmutils.expect_invalid_xcat_resp_data(res):
                 res_image = res['info'][0][0]
                 res_img_name = res_image.strip().split(" ")[0]
 
@@ -516,7 +518,7 @@ class ZVMImages(object):
         except (exception.ZVMXCATRequestFailed,
                 exception.ZVMInvalidXCATResponseDataError,
                 exception.ZVMXCATInternalError) as err:
-            LOG.warn(_LW("Illegal date for last_use_date %s") %
+            LOG.warning(_LW("Illegal date for last_use_date %s"),
                      err.format_message())
 
         return last_use_date_string
@@ -531,16 +533,16 @@ class ZVMImages(object):
                 re.match(timere, last_use_date_string)):
             LOG.debug("The format for last_use_date is valid ")
         else:
-            LOG.warn(_LW("The format for image %s record in xcat table "
+            LOG.warning(_LW("The format for image %s record in xcat table "
                 "osimage's last_used_date is not valid. The correct "
-                "format is auto:last_use_date:yyyy-mm-dd") % image_name)
+                "format is auto:last_use_date:yyyy-mm-dd"), image_name)
             return
 
         try:
             last_use_date_datetime = datetime.datetime.strptime(
                                     last_use_date_string, '%Y-%m-%d')
         except Exception as err:
-            LOG.warn(_LW("Illegal date for last_use_date %(msg)s") % err)
+            LOG.warning(_LW("Illegal date for last_use_date %(msg)s"), err)
             return
 
         return last_use_date_datetime.date()
@@ -568,7 +570,7 @@ class ZVMImages(object):
                 last_use_date = image_list[i][1]
                 if self._verify_is_deletable_periodic(last_use_date,
                                                    clean_period):
-                    LOG.debug('Delete the image %s' % image_name_xcat)
+                    LOG.debug('Delete the image %s', image_name_xcat)
                     self.delete_image_from_xcat(image_name_xcat)
                 else:
                     LOG.debug("Keep the image")
@@ -605,7 +607,7 @@ class ZVMImages(object):
         with zvmutils.except_xcat_call_failed_and_reraise(
                 exception.ZVMImageError):
             result = zvmutils.xcat_request("GET", url)
-            with zvmutils.expect_invalid_xcat_resp_data():
+            with zvmutils.expect_invalid_xcat_resp_data(result):
                 if len(result['info']) == 0:
                     msg = _("'rinv <zvm_xcat_master> --freerepospace' returns "
                             "null, please check 'df -h /install', there may "
@@ -624,33 +626,25 @@ class ZVMImages(object):
                 else:
                     return xcat_free_space_threshold
 
-    def get_imgcapture_needed(self, instance):
+    def get_imgcapture_needed(self, instance, user_dict):
         """Get the space needed on xCAT MN for an image capture."""
-        LOG.debug("Getting image capture needed size for %s" %
+        LOG.debug("Getting %s root disk size as image capture max needed.",
                   instance['name'])
-
-        cmd = "df -h /"
-        result = None
-        result = zvmutils.xdsh(instance['name'], cmd)['data'][0]
-        imgcapture_needed_space = ""
         try:
-            result_data = result[0].split()
-            if (CONF.zvm_image_compression_level and
-                    int(CONF.zvm_image_compression_level) == 0):
-                imgcapture_needed_space = result_data[10]
-            else:
-                imgcapture_needed_space = result_data[11]
+            rdisk = ''.join(['MDISK ', CONF.zvm_user_root_vdev])
+            rdisk_dict = [mdisk for mdisk in user_dict
+                                    if (mdisk.__contains__(rdisk))]
+            if not rdisk_dict or not rdisk_dict[0]:
+                raise exception.ZVMImageError(msg="User direct info error")
 
-            if imgcapture_needed_space.endswith("G"):
-                imgcapture_needed_space_value = imgcapture_needed_space.rstrip(
-                                                                        "G")
-                return float(imgcapture_needed_space_value) * 2
-            elif imgcapture_needed_space.endswith("M"):
-                imgcapture_needed_space_value = imgcapture_needed_space.rstrip(
-                                                                        "M")
-                return (float(imgcapture_needed_space_value) / 1024) * 2
+            rdisk_list = rdisk_dict[0].split(' ')
+            # will get similar result USERID: MDISK 0100 3390 1 3338 0E3B MR
+            if rdisk_list[3] == '3390':
+                return int(rdisk_list[5]) * 737280 / 1024.0 / 1024 / 1024 * 2
+            elif rdisk_list[3] == '9336':
+                return int(rdisk_list[5]) * 512 / 1024.0 / 1024 / 1024 * 2
             else:
-                return const.ZVM_IMAGE_SIZE_MAX
+                raise exception.ZVMImageError(msg="Unknown disk type")
         except (IndexError, ValueError, TypeError) as err:
             raise exception.ZVMImageError(msg=err)
 
@@ -673,8 +667,8 @@ class ZVMImages(object):
             else:
                 return image_name_xcat
         except (TypeError, IndexError):
-            LOG.error(_("xCAT imagename format for %s is not as expected")
-                      % image_name_xcat)
+            LOG.error(_("xCAT imagename format for %s is not as expected"),
+                      image_name_xcat)
 
     def _sort_image_by_use_date(self, image_list, left, right):
         """Sort the image_list by last_use_date from oldest image to latest."""
@@ -708,9 +702,9 @@ class ZVMImages(object):
         to_be_deleted_image_profile = []
 
         if len(image_list) <= 0:
-            msg = _("No image to be deleted, please create space manually "
+            msg = _LW("No image to be deleted, please create space manually "
                     "on xcat(%s).") % CONF.zvm_xcat_server
-            raise exception.ZVMImageError(msg=msg)
+            LOG.warning(msg)
         else:
             self._sort_image_by_use_date(image_list, 0, len(image_list) - 1)
             for img in image_list:
@@ -726,11 +720,13 @@ class ZVMImages(object):
                     if size_sum >= size_needed:
                         return to_be_deleted_image_profile
 
-        if size_sum >= current_needed:
-            return to_be_deleted_image_profile
-        else:
-            msg = _("xCAT MN space not enough for the current image operation")
-            raise exception.ZVMImageError(msg=msg)
+        if size_sum < current_needed:
+            msg = _LW("xCAT MN space not enough for current image operation: "
+                    "%(n)d G needed,%(a)d G available") % {'n': current_needed,
+                                                           'a': size_sum}
+            LOG.warning(msg)
+
+        return to_be_deleted_image_profile
 
     def prune_image_xcat(self, context, size_needed, current_needed):
         """Remove the images which meet remove criteria from xCAT."""
@@ -746,13 +742,18 @@ class ZVMImages(object):
         """Do a brief check to see if the image is a valid zVM image."""
         property_ = ['image_file_name', 'image_type_xcat', 'architecture',
                     'os_name', 'provisioning_method', 'os_version']
+        missing_prop = []
         for prop in property_:
-            if prop not in image_meta['properties'].keys():
-                msg = (_("The image %s is not a valid zVM image,please check "
-                       "if the image properties match the requirements.")
-                       % image_meta['id'])
-                LOG.error(msg)
-                raise exception.ZVMImageError(msg=msg)
+            if prop not in list(image_meta['properties'].keys()):
+                missing_prop.append(prop)
+
+        if len(missing_prop) > 0:
+            msg = (_("The image %(id)s is not a valid zVM image, "
+                   "property %(prop)s are missing") % {'id': image_meta['id'],
+                                                       'prop': missing_prop})
+            LOG.error(msg)
+            raise nova_exception.ImageUnacceptable(image_id=image_meta['id'],
+                                                   reason=msg)
 
     def cleanup_image_after_migration(self, inst_name):
         """Cleanup osimages in xCAT image repository while confirm migration
@@ -767,15 +768,15 @@ class ZVMImages(object):
 
     def get_root_disk_units(self, image_file_path):
         """use 'hexdump' to get the root_disk_units."""
-        cmd = "hexdump -n 48 -C %s" % image_file_path
         try:
-            (output, _toss) = utils.execute(cmd, shell=True)
+            (output, _toss) = utils.execute('hexdump', '-n', '48',
+                '-C', image_file_path)
         except processutils.ProcessExecutionError:
             msg = (_("Get image property failed,"
                     " please check whether the image file exists!"))
             raise exception.ZVMImageError(msg=msg)
 
-        LOG.debug("hexdump result is %s" % output)
+        LOG.debug("hexdump result is %s", output)
         try:
             root_disk_units = int(output[144:156])
         except ValueError:
@@ -789,14 +790,14 @@ class ZVMImages(object):
                       " support FBA and CKD disk"))
             raise exception.ZVMImageError(msg=msg)
 
-        LOG.debug("The image's root_disk_units is %s" % root_disk_units)
+        LOG.debug("The image's root_disk_units is %s", root_disk_units)
         return root_disk_units
 
     def set_image_root_disk_units(self, context, image_meta, image_file_path):
         """Set the property 'root_disk_units'to image."""
         new_image_meta = image_meta
         root_disk_units = self.get_root_disk_units(image_file_path)
-        LOG.debug("The image's root_disk_units is %s" % root_disk_units)
+        LOG.debug("The image's root_disk_units is %s", root_disk_units)
 
         (glance_image_service, image_id) = glance.get_remote_image_service(
                                                 context, image_meta['id'])

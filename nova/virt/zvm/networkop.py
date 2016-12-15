@@ -16,7 +16,6 @@
 from oslo_config import cfg
 from oslo_log import log as logging
 
-from nova.i18n import _
 from nova.virt.zvm import exception
 from nova.virt.zvm import utils as zvmutils
 
@@ -32,7 +31,7 @@ class NetworkOperator(object):
     """Configuration check and manage MAC address."""
 
     def __init__(self):
-        self._xcat_url = zvmutils.XCATUrl()
+        self._xcat_url = zvmutils.get_xcat_url()
 
     def add_xcat_host(self, node, ip, host_name):
         """Add/Update hostname/ip bundle in xCAT MN nodes table."""
@@ -161,27 +160,8 @@ class NetworkOperator(object):
         nic_name = "fake"
         self.add_xcat_mac(instance_name, nic_name, fake_mac_addr)
 
-    def create_nic(self, zhcpnode, inst_name, nic_name, mac_address, vdev,
-                   userid=None):
-        """Create network information in xCAT and zVM user direct."""
-        macid = mac_address.replace(':', '')[-6:]
-        self._add_instance_nic(zhcpnode, inst_name, vdev, macid, userid)
+    def create_xcat_table_about_nic(self, zhcpnode, inst_name,
+                                    nic_name, mac_address, vdev):
         self._delete_xcat_mac(inst_name)
         self.add_xcat_mac(inst_name, vdev, mac_address, zhcpnode)
         self.add_xcat_switch(inst_name, nic_name, vdev, zhcpnode)
-
-    def _add_instance_nic(self, zhcpnode, inst_name, vdev, macid, userid=None):
-        """Add NIC defination into user direct."""
-        if userid is None:
-            command = ("/opt/zhcp/bin/smcli Image_Definition_Update_DM -T %s" %
-                       inst_name)
-        else:
-            command = ("/opt/zhcp/bin/smcli Image_Definition_Update_DM -T %s" %
-                       userid)
-        command += " -k \'NICDEF=VDEV=%s TYPE=QDIO " % vdev
-        command += "MACID=%s\'" % macid
-        try:
-            zvmutils.xdsh(zhcpnode, command)
-        except exception.ZVMXCATXdshFailed as err:
-            msg = _("Adding nic error: %s") % err.format_message()
-            raise exception.ZVMNetworkError(msg=msg)

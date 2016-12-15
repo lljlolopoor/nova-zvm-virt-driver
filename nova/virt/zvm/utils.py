@@ -15,9 +15,12 @@
 import contextlib
 import functools
 import os
+import pwd
 import shutil
+import six
 from six.moves import http_client as httplib
 import socket
+import ssl
 import time
 
 from oslo_config import cfg
@@ -28,9 +31,10 @@ from oslo_utils import excutils
 from nova import block_device
 from nova.compute import power_state
 from nova import exception as nova_exception
-from nova.i18n import _, _LE, _LI
+from nova.i18n import _, _LE, _LI, _LW
 from nova.virt import driver
 from nova.virt.zvm import const
+from nova.virt.zvm import dist
 from nova.virt.zvm import exception
 
 
@@ -40,21 +44,14 @@ CONF = cfg.CONF
 CONF.import_opt('instances_path', 'nova.compute.manager')
 
 
-# It means we introduced 'version' concept at 2.8.3.7
-# later on, any new features especially backward incompatible
-# change need a new version such as
-# Support_xxxx = 'x.x.x.x', then we will compare whether
-# The XCAT we are using has higher or lower version than x.x.x.x
-# and do different things according to the version
-# we might INFO in log if version is lower than XCAT_INIT_VERSION
-XCAT_INIT_VERSION = '2.8.3.7'
+_XCAT_URL = None
 
 
 class XCATUrl(object):
-    """To return xCAT url for invoking xCAT REST API."""
+    """To return xCAT URLs for invoking xCAT REST APIs."""
 
     def __init__(self):
-        """Set constant that used to form xCAT url."""
+        """Set constants used to form xCAT URLs."""
         self.PREFIX = '/xcatws'
         self.SUFFIX = ('?userName=' + CONF.zvm_xcat_username +
                       '&password=' + CONF.zvm_xcat_password +
@@ -78,15 +75,61 @@ class XCATUrl(object):
         self.IMGIMPORT = '/import'
         self.BOOTSTAT = '/bootstate'
         self.XDSH = '/dsh'
+        self.VERSION = '/version'
+        self.PCONTEXT = '&requestid='
+        self.PUUID = '&objectid='
+        self.DIAGLOGS = '/logs/diagnostics'
+        self.PNODERANGE = '&nodeRange='
+        self.EXECCMDONVM = '/execcmdonvm'
 
     def _nodes(self, arg=''):
         return self.PREFIX + self.NODES + arg + self.SUFFIX
 
-    def _vms(self, arg=''):
-        return self.PREFIX + self.VMS + arg + self.SUFFIX
+    def _vms(self, arg='', vmuuid='', context=None):
+        rurl = self.PREFIX + self.VMS + arg + self.SUFFIX
+        rurl = self._append_context(rurl, context)
+        rurl = self._append_instanceid(rurl, vmuuid)
+        return rurl
+
+    def _append_context(self, rurl, context=None):
+        # The context is always optional, to allow incremental exploitation of
+        # the new parameter.  When it is present and it has a request ID, xCAT
+        # logs the request ID so it's easier to link xCAT log entries to
+        # OpenStack log entries.
+        if context is not None:
+            try:
+                rurl = rurl + self.PCONTEXT + context.request_id
+            except Exception as err:
+                # Cannot use format_message() in this context, because the
+                # Exception class does not implement that method.
+                msg = _("Failed to append request ID to URL %(url)s : %(err)s"
+                        ) % {'url': rurl, 'err': six.text_type(err)}
+                LOG.error(msg)
+                # Continue and return the original URL once the error is logged
+                # Failing the request over this is NOT desired.
+        return rurl
+
+    def _append_instanceid(self, rurl, vmuuid):
+        # The instance ID is always optional.  When it is present, xCAT logs it
+        # so it's easier to link xCAT log entries to OpenStack log entries.
+        if vmuuid:
+            rurl = rurl + self.PUUID + vmuuid
+        return rurl
+
+    def _append_nodeRange(self, rurl, nodeRange):
+        if nodeRange:
+            rurl = rurl + self.PNODERANGE + nodeRange
+        return rurl
 
     def _hv(self, arg=''):
         return self.PREFIX + self.HV + arg + self.SUFFIX
+
+    def _diag_logs(self, arg='', nodeRange='', vmuuid='', context=None):
+        rurl = self.PREFIX + self.DIAGLOGS + arg + self.SUFFIX
+        rurl = self._append_nodeRange(rurl, nodeRange)
+        rurl = self._append_context(rurl, context)
+        rurl = self._append_instanceid(rurl, vmuuid)
+        return rurl
 
     def rpower(self, arg=''):
         return self.PREFIX + self.NODES + arg + self.POWER + self.SUFFIX
@@ -116,11 +159,13 @@ class XCATUrl(object):
     def chhv(self, arg=''):
         return self._hv(arg)
 
-    def mkvm(self, arg=''):
-        return self._vms(arg)
+    def mkvm(self, arg='', vmuuid='', context=None):
+        rurl = self._vms(arg, vmuuid, context)
+        return rurl
 
-    def rmvm(self, arg=''):
-        return self._vms(arg)
+    def rmvm(self, arg='', vmuuid='', context=None):
+        rurl = self._vms(arg, vmuuid, context)
+        return rurl
 
     def tabdump(self, arg='', addp=None):
         rurl = self.PREFIX + self.TABLES + arg + self.SUFFIX
@@ -177,6 +222,10 @@ class XCATUrl(object):
         """Run shell command."""
         return self.PREFIX + self.NODES + arg + self.XDSH + self.SUFFIX
 
+    def execcmdonvm(self, arg=''):
+        """Run shell command after support IUCV."""
+        return self.PREFIX + self.NODES + arg + self.EXECCMDONVM + self.SUFFIX
+
     def network(self, arg='', addp=None):
         rurl = self.PREFIX + self.NETWORK + arg + self.SUFFIX
         if addp is not None:
@@ -184,14 +233,73 @@ class XCATUrl(object):
         else:
             return rurl
 
+    def version(self):
+        return self.PREFIX + self.VERSION + self.SUFFIX
+
+    def mkdiag(self, arg='', nodeRange='', vmuuid='', context=None):
+        rurl = self._diag_logs(arg, nodeRange, vmuuid, context)
+        return rurl
+
+
+class HTTPSClientAuthConnection(httplib.HTTPSConnection):
+    """For https://wiki.openstack.org/wiki/OSSN/OSSN-0033"""
+
+    def __init__(self, host, port, ca_file, timeout=None, key_file=None,
+                 cert_file=None):
+        httplib.HTTPSConnection.__init__(self, host, port,
+                                         key_file=key_file,
+                                         cert_file=cert_file)
+        self.key_file = key_file
+        self.cert_file = cert_file
+        self.ca_file = ca_file
+        self.timeout = timeout
+        self.use_ca = True
+
+        if self.ca_file is None:
+            LOG.debug("no xCAT CA file specified, this is considered "
+                      "not secure")
+            self.use_ca = False
+
+    def connect(self):
+        sock = socket.create_connection((self.host, self.port), self.timeout)
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+
+        if (self.ca_file is not None and
+            not os.path.exists(self.ca_file)):
+            LOG.warning(_LW("the CA file %(ca_file) does not exist!"),
+                        {'ca_file': self.ca_file})
+            self.use_ca = False
+
+        if not self.use_ca:
+            self.sock = ssl.wrap_socket(sock, self.key_file, self.cert_file,
+                                        cert_reqs=ssl.CERT_NONE)
+        else:
+            self.sock = ssl.wrap_socket(sock, self.key_file, self.cert_file,
+                                        ca_certs=self.ca_file,
+                                        cert_reqs=ssl.CERT_REQUIRED)
+
+
+def get_xcat_url():
+    global _XCAT_URL
+
+    if _XCAT_URL is not None:
+        return _XCAT_URL
+
+    _XCAT_URL = XCATUrl()
+    return _XCAT_URL
+
 
 class XCATConnection(object):
     """Https requests to xCAT web service."""
 
     def __init__(self):
         """Initialize https connection to xCAT service."""
+        self.port = 443
         self.host = CONF.zvm_xcat_server
-        self.conn = httplib.HTTPSConnection(self.host,
+        self.conn = HTTPSClientAuthConnection(self.host, self.port,
+                        CONF.zvm_xcat_ca_file,
                         timeout=CONF.zvm_xcat_connection_timeout)
 
     def request(self, method, url, body=None, headers=None):
@@ -203,7 +311,7 @@ class XCATConnection(object):
          'message': response message}
 
         """
-        headers = headers or []
+        headers = headers or {}
         if body is not None:
             body = jsonutils.dumps(body)
             headers = {'content-type': 'text/plain',
@@ -214,7 +322,7 @@ class XCATConnection(object):
                   "Request-method:%(method)s "
                   "URL:%(url)s "
                   "Headers:%(headers)s "
-                  "Body:%(body)s" %
+                  "Body:%(body)s",
                   {'xcat_server': CONF.zvm_xcat_server,
                    'method': method,
                    'url': url.replace(_rep_ptn, ''),  # hide password in log
@@ -242,7 +350,7 @@ class XCATConnection(object):
             'reason': res.reason,
             'message': msg}
 
-        LOG.debug("xCAT response: %s" % str(resp))
+        LOG.debug("xCAT response: %s", str(resp))
 
         # Only "200" or "201" returned from xCAT can be considered
         # as good status
@@ -261,11 +369,11 @@ class XCATConnection(object):
         return resp
 
 
-def xcat_request(method, url, body=None, headers=None):
+def xcat_request(method, url, body=None, headers=None, ignore_warning=False):
     headers = headers or {}
     conn = XCATConnection()
     resp = conn.request(method, url, body, headers)
-    return load_xcat_resp(resp['message'])
+    return load_xcat_resp(resp['message'], ignore_warning=ignore_warning)
 
 
 def jsonloads(jsonstr):
@@ -278,12 +386,13 @@ def jsonloads(jsonstr):
 
 
 @contextlib.contextmanager
-def expect_invalid_xcat_resp_data():
+def expect_invalid_xcat_resp_data(data=''):
     """Catch exceptions when using xCAT response data."""
     try:
         yield
     except (ValueError, TypeError, IndexError, AttributeError,
             KeyError) as err:
+        LOG.error(_('Parse %s encounter error'), data)
         raise exception.ZVMInvalidXCATResponseDataError(msg=err)
 
 
@@ -309,7 +418,7 @@ def ignore_errors():
         yield
     except Exception as err:
         emsg = format_exception_msg(err)
-        LOG.debug("Ignore an error: %s" % emsg)
+        LOG.debug("Ignore an error: %s", emsg)
         pass
 
 
@@ -336,6 +445,8 @@ def convert_to_mb(s):
     try:
         if s.endswith('G'):
             return float(s[:-1].strip()) * 1024
+        elif s.endswith('T'):
+            return float(s[:-1].strip()) * 1024 * 1024
         else:
             return float(s[:-1].strip())
     except (IndexError, ValueError, KeyError, TypeError) as e:
@@ -365,7 +476,7 @@ def translate_xcat_resp(rawdata, dirt):
     data = {}
 
     for ls in data_list:
-        for k in dirt.keys():
+        for k in list(dirt.keys()):
             if ls.__contains__(dirt[k]):
                 data[k] = ls[(ls.find(dirt[k]) + len(dirt[k])):].strip()
                 break
@@ -384,7 +495,7 @@ def mapping_power_stat(power_stat):
 
 
 @wrap_invalid_xcat_resp_data_error
-def load_xcat_resp(message):
+def load_xcat_resp(message, ignore_warning=False):
     """Abstract information from xCAT REST response body.
 
     As default, xCAT response will in format of JSON and can be
@@ -420,7 +531,8 @@ def load_xcat_resp(message):
             else:
                 raise exception.ZVMXCATInternalError(msg=message)
 
-    _log_warnings(resp)
+    if not ignore_warning:
+        _log_warnings(resp)
 
     return resp
 
@@ -429,7 +541,7 @@ def _log_warnings(resp):
     for msg in (resp['info'], resp['node'], resp['data']):
         msgstr = str(msg)
         if 'warn' in msgstr.lower():
-            LOG.info(_LI("Warning from xCAT: %s") % msgstr)
+            LOG.info(_LI("Warning from xCAT: %s"), msgstr)
 
 
 def _is_warning_or_recoverable_issue(err_str):
@@ -463,20 +575,11 @@ def _is_warning(err_str):
     return False
 
 
-def volume_in_mapping(mount_device, block_device_info):
+def _volume_in_mapping(mount_device, block_device_info):
     block_device_list = [block_device.strip_dev(vol['mount_device'])
                          for vol in
                          driver.block_device_info_get_mapping(
                              block_device_info)]
-    swap = driver.block_device_info_get_swap(block_device_info)
-    if driver.swap_is_usable(swap):
-        block_device_list.append(
-            block_device.strip_dev(swap['device_name']))
-    block_device_list += [block_device.strip_dev(ephemeral['device_name'])
-                          for ephemeral in
-                          driver.block_device_info_get_ephemerals(
-                              block_device_info)]
-
     LOG.debug("block_device_list %s", block_device_list)
     return block_device.strip_dev(mount_device) in block_device_list
 
@@ -488,37 +591,74 @@ def is_volume_root(root_device, mountpoint):
 
 
 def is_boot_from_volume(block_device_info):
-    root_mount_device = '/dev/' + const.ZVM_DEFAULT_ROOT_VOLUME
-    root_mount_device = root_mount_device.replace('/dev/s', '/dev/v')
-    boot_from_volume = volume_in_mapping(root_mount_device, block_device_info)
+    root_mount_device = driver.block_device_info_get_root(block_device_info)
+    boot_from_volume = _volume_in_mapping(root_mount_device,
+                                          block_device_info)
     return root_mount_device, boot_from_volume
 
 
 def get_host():
-    return ''.join([os.environ["USER"], '@', CONF.my_ip])
+    return ''.join([pwd.getpwuid(os.geteuid()).pw_name, '@', CONF.my_ip])
+
+
+def get_xcat_version():
+    """Return the version of xCAT"""
+    url = get_xcat_url().version()
+    data = xcat_request('GET', url)['data']
+
+    with expect_invalid_xcat_resp_data(data):
+        version = data[0][0].split()[1]
+        version = version.strip()
+        return version
+
+
+def xcat_support_chvm_smcli():
+    """Return true if xCAT version support clone"""
+    xcat_version = get_xcat_version()
+    return map(int, xcat_version.split('.')) >= map(int,
+        const.XCAT_SUPPORT_CHVM_SMCLI_VERSION.split('.'))
+
+
+def xcat_support_mkvm_ipl_param(xcat_version):
+    return map(int, xcat_version.split('.')) >= map(int,
+        const.XCAT_MKVM_SUPPORT_IPL.split('.'))
+
+
+def xcat_support_deployment_failure_diagnostics(xcat_version):
+    """Return true if xCAT version supports deployment failure diagnostics"""
+    return map(int, xcat_version.split('.')) >= map(int,
+        const.XCAT_SUPPORT_COLLECT_DIAGNOSTICS_DEPLOYFAILED.split('.'))
+
+
+def xcat_support_iucv(xcat_version=None):
+    if xcat_version is None:
+        xcat_version = get_xcat_version()
+    return map(int, xcat_version.split('.')) >= map(int,
+        const.XCAT_SUPPORT_IUCV.split('.'))
 
 
 def get_userid(node_name):
     """Returns z/VM userid for the xCAT node."""
-    url = XCATUrl().lsdef_node(''.join(['/', node_name]))
-    info = xcat_request('GET', url)['info']
-
-    with expect_invalid_xcat_resp_data():
-        for s in info[0]:
+    url = get_xcat_url().lsdef_node(''.join(['/', node_name]))
+    info = xcat_request('GET', url)
+    with expect_invalid_xcat_resp_data(info):
+        for s in info['info'][0]:
             if s.__contains__('userid='):
                 return s.strip().rpartition('=')[2]
 
 
 def xdsh(node, commands):
     """"Run command on xCAT node."""
-    LOG.debug('Run command %(cmd)s on xCAT node %(node)s' %
+    LOG.debug('Run command %(cmd)s on xCAT node %(node)s',
               {'cmd': commands, 'node': node})
 
     def xdsh_execute(node, commands):
         """Invoke xCAT REST API to execute command on node."""
         xdsh_commands = 'command=%s' % commands
-        body = [xdsh_commands]
-        url = XCATUrl().xdsh('/' + node)
+        # Add -q (quiet) option to ignore ssh warnings and banner msg
+        opt = 'options=-q'
+        body = [xdsh_commands, opt]
+        url = get_xcat_url().xdsh('/' + node)
         return xcat_request("PUT", url, body)
 
     with except_xcat_call_failed_and_reraise(
@@ -528,26 +668,41 @@ def xdsh(node, commands):
     return res_dict
 
 
-def punch_file(node, fn, fclass):
-    body = [" ".join(['--punchfile', fn, fclass, get_host()])]
-    url = XCATUrl().chvm('/' + node)
+def execcmdonvm(node, commands):
+    """"Run command on VM."""
+    LOG.debug('Run command %(cmd)s on VM %(node)s',
+              {'cmd': commands, 'node': node})
+
+    body = [commands]
+    url = get_xcat_url().execcmdonvm('/' + node)
+    return xcat_request("PUT", url, body)
+
+
+def punch_file(node, fn, fclass, remote_host=None, del_src=True):
+    """punch file to reader. """
+    if remote_host:
+        body = [" ".join(['--punchfile', fn, fclass, remote_host])]
+    else:
+        body = [" ".join(['--punchfile', fn, fclass])]
+    url = get_xcat_url().chvm('/' + node)
 
     try:
         xcat_request("PUT", url, body)
     except Exception as err:
         emsg = format_exception_msg(err)
         with excutils.save_and_reraise_exception():
-            LOG.error(_('Punch file to %(node)s failed: %(msg)s') %
+            LOG.error(_('Punch file to %(node)s failed: %(msg)s'),
                       {'node': node, 'msg': emsg})
     finally:
-        os.remove(fn)
+        if del_src:
+            os.remove(fn)
 
 
 def punch_adminpass_file(instance_path, instance_name, admin_password,
                          linuxdist):
     adminpass_fn = ''.join([instance_path, '/adminpwd.sh'])
     _generate_adminpass_file(adminpass_fn, admin_password, linuxdist)
-    punch_file(instance_name, adminpass_fn, 'X')
+    punch_file(instance_name, adminpass_fn, 'X', remote_host=get_host())
 
 
 def punch_xcat_auth_file(instance_path, instance_name):
@@ -555,7 +710,87 @@ def punch_xcat_auth_file(instance_path, instance_name):
     mn_pub_key = get_mn_pub_key()
     auth_fn = ''.join([instance_path, '/xcatauth.sh'])
     _generate_auth_file(auth_fn, mn_pub_key)
-    punch_file(instance_name, auth_fn, 'X')
+    punch_file(instance_name, auth_fn, 'X', remote_host=get_host())
+
+
+def _generate_iucv_cmd_file(iucv_cmd_file_path, cmd):
+    lines = ['#!/bin/bash\n', cmd]
+    with open(iucv_cmd_file_path, 'w') as f:
+        f.writelines(lines)
+
+
+def add_iucv_in_zvm_table(instance_name):
+    result = xcat_cmd_gettab('zvm', 'node', instance_name, "status")
+    if not result:
+        status = "IUCV=1"
+    else:
+        status = result + ';IUCV=1'
+    xcat_cmd_settab('zvm', 'node', instance_name, "status", status)
+
+
+def punch_iucv_file(os_ver, zhcp, zhcp_userid, instance_name,
+                    instance_path):
+    """put iucv server and service files to reader."""
+    xcat_iucv_path = '/opt/zhcp/bin/IUCV'
+    # generate iucvserver file
+    iucv_server_fn = ''.join([xcat_iucv_path, '/iucvserv'])
+    iucv_server_path = '/usr/bin/iucvserv'
+    punch_path = '/var/opt/xcat/transport'
+    # generate iucvserver service and script file
+    iucv_service_path = ''
+    start_iucv_service_sh = ''
+    (distro, release) = dist.ListDistManager().parse_dist(os_ver)
+    if((distro == "rhel" and release < '7') or (
+                 distro == "sles" and release < '12')):
+        iucv_serverd_fn = ''.join([xcat_iucv_path, '/iucvserd'])
+        iucv_service_name = 'iucvserd'
+        iucv_service_path = '/etc/init.d/' + iucv_service_name
+        start_iucv_service_sh = 'chkconfig --add iucvserd 2>&1\n'
+        start_iucv_service_sh += 'service iucvserd  start 2>&1\n'
+    else:
+        iucv_serverd_fn = ''.join([xcat_iucv_path, '/iucvserd.service'])
+        iucv_service_name = 'iucvserd.service'
+        start_iucv_service_sh = 'systemctl enable iucvserd 2>&1\n'
+        start_iucv_service_sh += 'systemctl start iucvserd 2>&1\n'
+        if((distro == "rhel" and release >= '7') or (distro == "ubuntu")):
+            iucv_service_path = '/lib/systemd/system/' + iucv_service_name
+        if(distro == "sles" and release >= '12'):
+            iucv_service_path = '/usr/lib/systemd/system/' + iucv_service_name
+
+    iucv_cmd_file_path = instance_path + '/iucvexec.sh'
+    cmd = '\n'.join((
+        # if when execute this script, conf4z hasn't received iucv file.
+        "spoolid=`vmur li | awk '/iucvserv/{print \$2}'|tail -1`",
+        "vmur re -f $spoolid /usr/bin/iucvserv 2>&1 >/var/log/messages",
+        "spoolid=`vmur li | awk '/iucvserd/{print \$2}'|tail -1`",
+        "vmur re -f $spoolid %s  2>&1 >/var/log/messages" % iucv_service_path,
+        # if conf4z has received iucv files first.
+        "cp -rf %s/iucvserv %s 2>&1 >/var/log/messages" % (punch_path,
+                                                           iucv_server_path),
+        "cp -rf %s/%s %s 2>&1 >/var/log/messages" % (punch_path,
+                                        iucv_service_name, iucv_service_path),
+        "chmod +x %s %s" % (iucv_server_path, iucv_service_path),
+        "echo -n %s >/etc/iucv_authorized_userid 2>&1" % zhcp_userid,
+        start_iucv_service_sh
+        ))
+    _generate_iucv_cmd_file(iucv_cmd_file_path, cmd)
+    punch_file(instance_name, iucv_server_fn, 'X',
+                                   remote_host=zhcp, del_src=False)
+    punch_file(instance_name, iucv_serverd_fn, 'X',
+                                   remote_host=zhcp, del_src=False)
+    punch_file(instance_name, iucv_cmd_file_path, 'X', remote_host=get_host(),
+                                                     del_src=False)
+    # set VM's communicate type is IUCV
+    add_iucv_in_zvm_table(instance_name)
+
+
+def punch_iucv_authorized_file(old_inst_name, new_inst_name, zhcp_userid):
+    cmd = "echo -n %s >/etc/iucv_authorized_userid 2>&1" % zhcp_userid
+    iucv_cmd_file_path = '/tmp/%s.sh' % new_inst_name[-8:]  # nosec
+    _generate_iucv_cmd_file(iucv_cmd_file_path, cmd)
+    punch_file(new_inst_name, iucv_cmd_file_path, 'X', remote_host=get_host())
+    # set VM's communicate type is IUCV
+    add_iucv_in_zvm_table(old_inst_name)
 
 
 def process_eph_disk(instance_name, vdev=None, fmt=None, mntdir=None):
@@ -569,7 +804,7 @@ def process_eph_disk(instance_name, vdev=None, fmt=None, mntdir=None):
 
 
 def aemod_handler(instance_name, func_name, parms):
-    url = XCATUrl().chvm('/' + instance_name)
+    url = get_xcat_url().chvm('/' + instance_name)
     body = [" ".join(['--aemod', func_name, parms])]
 
     try:
@@ -578,18 +813,18 @@ def aemod_handler(instance_name, func_name, parms):
         emsg = format_exception_msg(err)
         with excutils.save_and_reraise_exception():
             LOG.error(_LE('Invoke AE method function: %(func)s on %(node)s '
-                          'failed with reason: %(msg)s') %
+                          'failed with reason: %(msg)s'),
                      {'func': func_name, 'node': instance_name, 'msg': emsg})
 
 
 def punch_configdrive_file(transportfiles, instance_name):
-    punch_file(instance_name, transportfiles, 'X')
+    punch_file(instance_name, transportfiles, 'X', remote_host=get_host())
 
 
 def punch_zipl_file(instance_path, instance_name, lun, wwpn, fcp, volume_meta):
     zipl_fn = ''.join([instance_path, '/ziplset.sh'])
     _generate_zipl_file(zipl_fn, lun, wwpn, fcp, volume_meta)
-    punch_file(instance_name, zipl_fn, 'X')
+    punch_file(instance_name, zipl_fn, 'X', remote_host=get_host())
 
 
 def generate_vdev(base, offset=1):
@@ -641,7 +876,7 @@ def _generate_auth_file(fn, pub_key):
 
 def _generate_adminpass_file(fn, admin_password, linuxdist):
     pwd_str = linuxdist.get_change_passwd_command(admin_password)
-    lines = ['#! /bin/sh\n', pwd_str]
+    lines = ['#!/bin/bash\n', pwd_str]
     with open(fn, 'w') as f:
         f.writelines(lines)
 
@@ -650,39 +885,13 @@ def _generate_zipl_file(fn, lun, wwpn, fcp, volume_meta):
     image = volume_meta['image']
     ramdisk = volume_meta['ramdisk']
     root = volume_meta['root']
-    os_type = volume_meta['os_type']
-    if os_type == 'rhel':
-        lines = ['#!/bin/bash\n',
-        ('echo -e "[defaultboot]\\n'
-         'timeout=5\\n'
-         'default=boot-from-volume\\n'
-         'target=/boot/\\n'
-         '[boot-from-volume]\\n'
-         'image=%(image)s\\n'
-         'ramdisk=%(ramdisk)s\\n'
-         'parameters=\\"root=%(root)s '
-         'rd_ZFCP=0.0.%(fcp)s,0x%(wwpn)s,0x%(lun)s selinux=0\\""'
-         '>/etc/zipl_volume.conf\n'
-         'zipl -c /etc/zipl_volume.conf')
-            % {'image': image, 'ramdisk': ramdisk, 'root': root, 'fcp': fcp,
-                'wwpn': wwpn, 'lun': lun}]
-    else:  # sles
-        lines = ['#!/bin/bash\n',
-        ('echo -e "[defaultboot]\\n'
-         'default=boot-from-volume\\n'
-         '[boot-from-volume]\\n'
-         'image=%(image)s\\n'
-         'target = /boot/zipl\\n'
-         'ramdisk=%(ramdisk)s\\n'
-         'parameters=\\"root=%(root)s '
-         'zfcp.device=0.0.%(fcp)s,0x%(wwpn)s,0x%(lun)s\\""'
-         '>/etc/zipl_volume.conf\n'
-         'mkinitrd\n'
-         'zipl -c /etc/zipl_volume.conf')
-            % {'image': image, 'ramdisk': ramdisk, 'root': root, 'fcp': fcp,
-                'wwpn': wwpn, 'lun': lun}]
+    os_version = volume_meta['os_version']
+    dist_manager = dist.ListDistManager()
+    linux_dist = dist_manager.get_linux_dist(os_version)()
+    zipl_script_lines = linux_dist.get_zipl_script_lines(
+                            image, ramdisk, root, fcp, wwpn, lun)
     with open(fn, 'w') as f:
-        f.writelines(lines)
+        f.writelines(zipl_script_lines)
 
 
 @wrap_invalid_xcat_resp_data_error
@@ -715,21 +924,35 @@ def parse_os_version(os_version):
 def xcat_cmd_gettab(table, col, col_value, attr):
     addp = ("&col=%(col)s=%(col_value)s&attribute=%(attr)s" %
             {'col': col, 'col_value': col_value, 'attr': attr})
-    url = XCATUrl().gettab('/%s' % table, addp)
+    url = get_xcat_url().gettab('/%s' % table, addp)
     res_info = xcat_request("GET", url)
+    with expect_invalid_xcat_resp_data(res_info):
+        if res_info['data']:
+            return res_info['data'][0][0]
+        else:
+            return ''
+
+
+def xcat_cmd_settab(table, col, col_value, attr, value):
+    """Add status value for node in database table."""
+    commands = ("%(col)s=%(col_value)s %(table)s.%(attr)s=%(value)s" %
+              {'col': col, 'col_value': col_value,
+                         'attr': attr, 'table': table, 'value': value})
+    url = get_xcat_url().tabch("/%s" % table)
+    body = [commands]
     with expect_invalid_xcat_resp_data():
-        return res_info['data'][0][0]
+        return xcat_request("PUT", url, body)['data']
 
 
 def xcat_cmd_gettab_multi_attr(table, col, col_value, attr_list):
     attr_str = ''.join(["&attribute=%s" % attr for attr in attr_list])
     addp = ("&col=%(col)s=%(col_value)s&%(attr)s" %
             {'col': col, 'col_value': col_value, 'attr': attr_str})
-    url = XCATUrl().gettab('/%s' % table, addp)
+    url = get_xcat_url().gettab('/%s' % table, addp)
     res_data = xcat_request("GET", url)['data']
 
     outp = {}
-    with expect_invalid_xcat_resp_data():
+    with expect_invalid_xcat_resp_data(res_data):
         for attr in attr_list:
             for data in res_data:
                 if attr in data[0]:
@@ -772,26 +995,25 @@ def looping_call(f, sleep=5, inc_sleep=0, max_sleep=60, timeout=600,
         except exceptions:
             retry = not expired
             if retry:
-                LOG.debug("Will re-try %(fname)s in %(itv)d seconds" %
+                LOG.debug("Will re-try %(fname)s in %(itv)d seconds",
                           {'fname': f.__name__, 'itv': sleep})
                 time.sleep(sleep)
                 sleep = min(sleep + inc_sleep, max_sleep)
             else:
-                LOG.debug("Looping call %s timeout" % f.__name__)
+                LOG.debug("Looping call %s timeout", f.__name__)
             continue
         retry = False
 
 
 class PathUtils(object):
     def open(self, path, mode):
-        """Wrapper on __builin__.open used to simplify unit testing."""
-        import __builtin__
-        return __builtin__.open(path, mode)
+        """Wrapper on six.moves.builtins.open used to simplify unit testing."""
+        return six.moves.builtins.open(path, mode)
 
     def _get_image_tmp_path(self):
         image_tmp_path = os.path.normpath(CONF.zvm_image_tmp_path)
         if not os.path.exists(image_tmp_path):
-            LOG.debug('Creating folder %s for image temp files' %
+            LOG.debug('Creating folder %s for image temp files',
                      image_tmp_path)
             os.makedirs(image_tmp_path)
         return image_tmp_path
@@ -800,7 +1022,7 @@ class PathUtils(object):
         bundle_tmp_path = os.path.join(self._get_image_tmp_path(), "spawn_tmp",
                                        tmp_file_fn)
         if not os.path.exists(bundle_tmp_path):
-            LOG.debug('Creating folder %s for image bundle temp file' %
+            LOG.debug('Creating folder %s for image bundle temp file',
                       bundle_tmp_path)
             os.makedirs(bundle_tmp_path)
         return bundle_tmp_path
@@ -812,21 +1034,21 @@ class PathUtils(object):
         snapshot_folder = os.path.join(self._get_image_tmp_path(),
                                        "snapshot_tmp")
         if not os.path.exists(snapshot_folder):
-            LOG.debug("Creating the snapshot folder %s" % snapshot_folder)
+            LOG.debug("Creating the snapshot folder %s", snapshot_folder)
             os.makedirs(snapshot_folder)
         return snapshot_folder
 
     def _get_punch_path(self):
         punch_folder = os.path.join(self._get_image_tmp_path(), "punch_tmp")
         if not os.path.exists(punch_folder):
-            LOG.debug("Creating the punch folder %s" % punch_folder)
+            LOG.debug("Creating the punch folder %s", punch_folder)
             os.makedirs(punch_folder)
         return punch_folder
 
     def get_spawn_folder(self):
         spawn_folder = os.path.join(self._get_image_tmp_path(), "spawn_tmp")
         if not os.path.exists(spawn_folder):
-            LOG.debug("Creating the spawn folder %s" % spawn_folder)
+            LOG.debug("Creating the spawn folder %s", spawn_folder)
             os.makedirs(spawn_folder)
         return spawn_folder
 
@@ -839,7 +1061,7 @@ class PathUtils(object):
         snapshot_time_path = os.path.join(self._get_snapshot_path(),
                                           self.make_time_stamp())
         if not os.path.exists(snapshot_time_path):
-            LOG.debug('Creating folder %s for image bundle temp file' %
+            LOG.debug('Creating folder %s for image bundle temp file',
                       snapshot_time_path)
             os.makedirs(snapshot_time_path)
         return snapshot_time_path
@@ -856,7 +1078,7 @@ class PathUtils(object):
         instance_folder = os.path.join(self._get_instances_path(), os_node,
                                        instance_name)
         if not os.path.exists(instance_folder):
-            LOG.debug("Creating the instance path %s" % instance_folder)
+            LOG.debug("Creating the instance path %s", instance_folder)
             os.makedirs(instance_folder)
         return instance_folder
 
@@ -907,7 +1129,7 @@ class NetworkUtils(object):
             (cfg_str, cmd_str, dns_str,
                 route_str) = self.generate_network_configration(network,
                                                 base_vdev, device_num, os_type)
-            LOG.debug('Network configure file content is: %s' % cfg_str)
+            LOG.debug('Network configure file content is: %s', cfg_str)
             target_net_conf_file_name = file_path + file_name
             cfg_files.append((target_net_conf_file_name, cfg_str))
             udev_cfg_str += self.generate_udev_configuration(device_num,

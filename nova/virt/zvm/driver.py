@@ -14,28 +14,35 @@
 
 import contextlib
 import datetime
+import itertools
+import operator
 import os
+import six
 import time
 import uuid
 
-from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_service import loopingcall
 from oslo_utils import excutils
 from oslo_utils import timeutils
 from oslo_utils import units
+from oslo_utils import versionutils
 
 from nova.api.metadata import base as instance_metadata
 from nova.compute import power_state
 from nova.compute import task_states
-from nova.compute import vm_mode
+from nova.compute import utils as compute_utils
+from nova.compute import vm_states
 from nova import exception as nova_exception
 from nova.i18n import _, _LI, _LW
+from nova.image import api as image_api
 from nova.image import glance
+from nova.objects import fields
 from nova import utils
 from nova.virt import configdrive
 from nova.virt import driver
+from nova.virt.zvm import conf
 from nova.virt.zvm import configdrive as zvmconfigdrive
 from nova.virt.zvm import const
 from nova.virt.zvm import dist
@@ -45,138 +52,14 @@ from nova.virt.zvm import instance as zvminstance
 from nova.virt.zvm import networkop
 from nova.virt.zvm import utils as zvmutils
 from nova.virt.zvm import volumeop
-from nova import volume
+from nova.volume import cinder
 
 
 LOG = logging.getLogger(__name__)
 
-zvm_opts = [
-    cfg.StrOpt('zvm_xcat_server',
-               default=None,
-               help='Host name or IP address of xCAT management_node'),
-    cfg.StrOpt('zvm_xcat_username',
-               default=None,
-               help='XCAT username'),
-    cfg.StrOpt('zvm_xcat_password',
-               default=None,
-               secret=True,
-               help='Password of the xCAT user'),
-    cfg.StrOpt('zvm_diskpool',
-               default=None,
-               help='Z/VM disk pool for ephemeral disks'),
-    cfg.StrOpt('zvm_host',
-               default=None,
-               help='Z/VM host that managed by xCAT MN.'),
-    cfg.StrOpt('zvm_xcat_group',
-               default='all',
-               help='XCAT group for OpenStack'),
-    cfg.StrOpt('zvm_scsi_pool',
-               default='xcatzfcp',
-               help='Default zfcp scsi disk pool'),
-    cfg.StrOpt('zvm_fcp_list',
-               default=None,
-               help='Configured fcp list can be used'),
-    cfg.StrOpt('zvm_zhcp_fcp_list',
-               default=None,
-               help='Configured fcp list dedicated to hcp'),
-    cfg.StrOpt('zvm_diskpool_type',
-               default='ECKD',
-               help='Default disk type for root disk, can be ECKD/FBA'),
-    cfg.BoolOpt('zvm_config_drive_inject_password',
-                default=False,
-                help='Sets the admin password in the config drive'),
-    cfg.StrOpt('zvm_vmrelocate_force',
-               default=None,
-               help='Force can be: (ARCHITECTURE) attempt relocation even '
-                    'though hardware architecture facilities or CP features '
-                    'are not available on destination system, '
-                    '(DOMAIN) attempt relocation even though VM would be '
-                    'moved outside of its domain, '
-                    'or (STORAGE) relocation should proceed even if CP '
-                    'determines that there are insufficient storage '
-                    'resources on destination system.'),
-    cfg.StrOpt('zvm_vmrelocate_immediate',
-               default='yes',
-               help='Immediate can be: (YES) VMRELOCATE command will do '
-                    'one early pass through virtual machine storage and '
-                    'then go directly to the quiesce stage, '
-                    'or (NO) specifies immediate processing.'),
-    cfg.StrOpt('zvm_vmrelocate_max_total',
-               default='nolimit',
-               help='Maximum wait time(seconds) for relocation to complete'),
-    cfg.StrOpt('zvm_vmrelocate_max_quiesce',
-               default='nolimit',
-               help='Maximum quiesce time(seconds) a VM may be stopped '
-                    'during a relocation attempt'),
-    cfg.IntOpt('zvm_reachable_timeout',
-               default=300,
-               help='Timeout(seconds) when start an instance.'),
-    cfg.IntOpt('zvm_xcat_connection_timeout',
-               default=3600,
-               help='XCAT connection read timeout(seconds)'),
-    cfg.IntOpt('zvm_console_log_size',
-               default=100,
-               help='Max console log size(kilobyte) get from xCAT'),
-    ]
-
-zvm_user_opts = [
-    cfg.StrOpt('zvm_user_profile',
-               default=None,
-               help='User profile for creating a z/VM userid'),
-    cfg.StrOpt('zvm_user_default_password',
-               default='dfltpass',
-               secret=True,
-               help='Default password for a new created z/VM user'),
-    cfg.StrOpt('zvm_user_default_privilege',
-               default='g',
-               help='Default privilege level for a new created z/VM user'),
-    cfg.StrOpt('zvm_user_root_vdev',
-               default='0100',
-               help='Virtual device number for ephemeral root disk'),
-    cfg.StrOpt('zvm_user_adde_vdev',
-               default='0101',
-               help='Virtual device number for additional ephemeral disk'),
-    cfg.StrOpt('zvm_user_volume_vdev',
-               default='0200',
-               help='Virtual device number for persistent volume, '
-                    'if there are more then one volumes, will use next vdev'),
-    ]
-
-zvm_image_opts = [
-    cfg.StrOpt('zvm_image_tmp_path',
-               default='/var/lib/nova/images',
-               help='The path to store the z/VM image files'),
-    cfg.StrOpt('zvm_default_ephemeral_mntdir',
-               default='/mnt/ephemeral',
-               help='The path to which the ephemeral disk be mounted'),
-    cfg.StrOpt('zvm_image_default_password',
-               default='rootpass',
-               secret=True,
-               help='Default os root password for a new created vm'),
-    cfg.IntOpt('xcat_image_clean_period',
-               default=30,
-               help='The period(days) to clean up an image that not be used '
-                     'for deploy in one xCAT MN within the defined time'),
-    cfg.IntOpt('xcat_free_space_threshold',
-               default=50,
-               help='The threshold for xCAT free space, if snapshot or spawn '
-                     'check xCAT free space not enough for its image '
-                     'operations, it will prune image to meet the threshold'),
-    cfg.StrOpt('zvm_xcat_master',
-               default=None,
-               help='The xCAT MM node name'),
-    cfg.StrOpt('zvm_image_compression_level',
-               default=None,
-               help='The level of gzip compression used when capturing disk'),
-    ]
-
-CONF = cfg.CONF
-CONF.register_opts(zvm_opts)
-CONF.register_opts(zvm_user_opts)
-CONF.register_opts(zvm_image_opts)
-CONF.import_opt('host', 'nova.netconf')
-CONF.import_opt('my_ip', 'nova.netconf')
-CONF.import_opt('default_ephemeral_format', 'nova.virt.driver')
+CONF = conf.CONF
+CONF.import_opt('host', 'nova.conf')
+CONF.import_opt('my_ip', 'nova.conf')
 
 ZVMInstance = zvminstance.ZVMInstance
 
@@ -186,28 +69,59 @@ class ZVMDriver(driver.ComputeDriver):
 
     capabilities = {
         "has_imagecache": True,
-        }
+        "supports_recreate": False,
+        "supports_migrate_to_same_host": True,
+        "supports_attach_interface": False
+    }
 
     def __init__(self, virtapi):
         super(ZVMDriver, self).__init__(virtapi)
-        self._xcat_url = zvmutils.XCATUrl()
+        self._xcat_url = zvmutils.get_xcat_url()
+
+        # incremental sleep interval list
+        _inc_slp = [5, 10, 20, 30, 60]
+        _slp = 5
+
+        # TODO(jichenjc): update _xcat_version when xcat reboot
+        self._xcat_version = self._get_xcat_version()
+        version_ok = self.has_min_version(const.XCAT_MINIMUM_VERSION)
+        while (not version_ok):
+            LOG.warning(_LW("WARNING: the xcat version communicating with is "
+                            "%(xcat_version)s, but the minimum requested "
+                            "version by openstack zvm driver is %(minimum)s "
+                            "will sleep some time and check again"),
+                            {'xcat_version': self._xcat_version,
+                             'minimum': const.XCAT_MINIMUM_VERSION})
+            self._xcat_version = self._get_xcat_version()
+            version_ok = self.has_min_version(const.XCAT_MINIMUM_VERSION)
+
+            _slp = len(_inc_slp) != 0 and _inc_slp.pop(0) or _slp
+            time.sleep(_slp)
 
         self._host_stats = []
-        try:
-            self._host_stats = self.update_host_status()
-            self._networkop = networkop.NetworkOperator()
-        except Exception as e:
-            # Ignore any exceptions and log as warning
-            emsg = zvmutils.format_exception_msg(e)
-            LOG.warn(_LW("Exception raised while initializing z/VM driver: %s")
-                     % emsg)
+        _slp = 5
 
+        while (self._host_stats == []):
+            try:
+                self._host_stats = self.update_host_status()
+            except Exception as e:
+                # Ignore any exceptions and log as warning
+                _slp = len(_inc_slp) != 0 and _inc_slp.pop(0) or _slp
+                msg = _LW("Failed to get host stats while initializing zVM "
+                          "driver due to reason %(reason)s, will re-try in "
+                          "%(slp)d seconds")
+                LOG.warning(msg, {'reason': six.text_type(e),
+                               'slp': _slp})
+                time.sleep(_slp)
+
+        self._networkop = networkop.NetworkOperator()
         self._zvm_images = imageop.ZVMImages()
         self._pathutils = zvmutils.PathUtils()
         self._networkutils = zvmutils.NetworkUtils()
         self._volumeop = volumeop.VolumeOperator()
-        self._volume_api = volume.API()
+        self._volume_api = cinder.API()
         self._dist_manager = dist.ListDistManager()
+        self._image_api = image_api.API()
 
     def init_host(self, host):
         """Initialize anything that is necessary for the driver to function,
@@ -217,8 +131,8 @@ class ZVMDriver(driver.ComputeDriver):
             self._volumeop.init_host(self._host_stats)
         except Exception as e:
             emsg = zvmutils.format_exception_msg(e)
-            LOG.warn(_LW("Exception raised while initializing z/VM driver: %s")
-                     % emsg)
+            LOG.warning(_LW("Exception raised while initializing z/VM driver: "
+                            "%s"), emsg)
 
     def get_info(self, instance):
         """Get the current status of an instance, by name (not ID!)
@@ -232,7 +146,7 @@ class ZVMDriver(driver.ComputeDriver):
 
         """
         inst_name = instance['name']
-        zvm_inst = ZVMInstance(instance)
+        zvm_inst = ZVMInstance(self, instance)
 
         try:
             return zvm_inst.get_info()
@@ -240,7 +154,7 @@ class ZVMDriver(driver.ComputeDriver):
             emsg = err.format_message()
             if (emsg.__contains__("Invalid nodes and/or groups") and
                     emsg.__contains__("Forbidden")):
-                LOG.warn(_LW("z/VM instance %s does not exist") % inst_name,
+                LOG.warning(_LW("z/VM instance %s does not exist"), inst_name,
                          instance=instance)
                 raise nova_exception.InstanceNotFound(instance_id=inst_name)
             else:
@@ -258,7 +172,7 @@ class ZVMDriver(driver.ComputeDriver):
 
         instances = []
 
-        with zvmutils.expect_invalid_xcat_resp_data():
+        with zvmutils.expect_invalid_xcat_resp_data(res_dict):
             data_entries = res_dict['data'][0][1:]
             for data in data_entries:
                 l = data.split(",")
@@ -273,9 +187,13 @@ class ZVMDriver(driver.ComputeDriver):
 
         return instances
 
-    def instance_exists(self, instance_name):
+    def _instance_exists(self, instance_name):
         """Overwrite this to using instance name as input parameter."""
         return instance_name in self.list_instances()
+
+    def instance_exists(self, instance):
+        """Overwrite this to using instance name as input parameter."""
+        return self._instance_exists(instance.name)
 
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, network_info=None, block_device_info=None,
@@ -303,13 +221,26 @@ class ZVMDriver(driver.ComputeDriver):
                                   attached to the instance.
 
         """
+        # This is because commit fbe31e461ac3f16edb795993558a2314b4c16b52
+        # changes the image_meta from dict to object, we have several
+        # unique property can't be handled well
+        # see bug 1537921 for detail info
+        image_meta = self._image_api.get(context, image_meta.id)
+
+        # For zVM instance, limit the maximum length of instance name to be 8
+        if len(instance['name']) > 8:
+            msg = (_("Don't support spawn vm on zVM hypervisor with instance "
+                "name: %s, please change your instance_name_template to make "
+                "sure the length of instance name is not longer than 8 "
+                "characters") % instance['name'])
+            raise nova_exception.InvalidInput(reason=msg)
+
         root_mount_device, boot_from_volume = zvmutils.is_boot_from_volume(
                                                             block_device_info)
         bdm = driver.block_device_info_get_mapping(block_device_info)
 
         if not network_info:
-            msg = _("Not support boot without a NIC. "
-            "A NIC connected to xCAT management network is required.")
+            msg = _("Not support boot without a NIC.")
             raise exception.ZVMDriverError(msg=msg)
 
         # Ensure the used image is a valid zVM image
@@ -317,15 +248,17 @@ class ZVMDriver(driver.ComputeDriver):
             self._zvm_images.zimage_check(image_meta)
 
         compute_node = CONF.zvm_host
-        zhcp = self._get_hcp_info()['hostname']
+        hcp_info = self._get_hcp_info()
+        zhcp = hcp_info['hostname']
+        zhcp_userid = hcp_info['userid']
 
-        zvm_inst = ZVMInstance(instance)
+        zvm_inst = ZVMInstance(self, instance)
         instance_path = self._pathutils.get_instance_path(compute_node,
                                                           zvm_inst._name)
         # Create network configuration files
         LOG.debug('Creating network configuration files '
-                    'for instance: %s' % zvm_inst._name, instance=instance)
-        base_nic_vdev = const.ZVM_DEFAULT_NIC_VDEV
+                    'for instance: %s', zvm_inst._name, instance=instance)
+        base_nic_vdev = CONF.zvm_default_nic_vdev
 
         if not boot_from_volume:
             os_version = image_meta['properties']['os_version']
@@ -333,15 +266,7 @@ class ZVMDriver(driver.ComputeDriver):
             volume_id = self._extract_volume_id(bdm, root_mount_device)
             volume_summery = self._volume_api.get(context, volume_id)
             volume_meta = volume_summery['volume_metadata']
-            os_type = volume_meta['os_type']
-            # FIXME (jichenjc), woraround now need more effort here
-            # os_type is sles or rhel before, we need to know
-            # they are rhel6 or 7 , sles11 or 12, but not considered before
-            os_version = ''
-            if os_type == 'rhel':
-                os_version == 'rhel6'
-            if os_type == 'sles':
-                os_version == 'sles11'
+            os_version = volume_meta['os_version']
 
         linuxdist = self._dist_manager.get_linux_dist(os_version)()
         files_and_cmds = linuxdist.create_network_configuration_files(
@@ -356,21 +281,18 @@ class ZVMDriver(driver.ComputeDriver):
             admin_password = CONF.zvm_image_default_password
         transportfiles = None
         if configdrive.required_by(instance):
-            transportfiles = self._create_config_drive(instance_path,
-                instance, injected_files, admin_password, net_conf_cmds,
-                linuxdist)
+            transportfiles = self._create_config_drive(context,
+                instance_path, instance, image_meta, injected_files,
+                admin_password, net_conf_cmds, linuxdist)
 
-        LOG.info(_LI("The instance %(name)s is spawning at %(node)s") %
+        LOG.info(_LI("The instance %(name)s is spawning at %(node)s"),
                  {'name': zvm_inst._name, 'node': compute_node},
                  instance=instance)
 
         spawn_start = time.time()
 
         try:
-            # Create xCAT node for the instance and preset network
-            zvm_inst.create_xcat_node(zhcp)
-            self._preset_instance_network(zvm_inst._name, network_info)
-
+            deploy_image_name = None
             if not boot_from_volume:
                 tmp_file_fn = None
                 bundle_file_path = None
@@ -388,40 +310,35 @@ class ZVMDriver(driver.ComputeDriver):
                 elif bundle_file_path is not None:
                     self._pathutils.clean_temp_folder(bundle_file_path)
 
-            # Create z/VM userid and update node info for instance
-            zvm_inst.create_userid(block_device_info, image_meta)
-            if not boot_from_volume:
-                zvm_inst.update_node_info(image_meta)
+                deploy_image_name = self._zvm_images.get_imgname_xcat(
+                                        instance['image_ref'])
 
-            # Create nic for z/VM instance
-            nic_vdev = base_nic_vdev
-            zhcpnode = self._get_hcp_info()['nodename']
-            for vif in network_info:
-                LOG.debug('Create nic for instance: %(inst)s, MAC: '
-                            '%(mac)s Network: %(network)s Vdev: %(vdev)s' %
-                          {'inst': zvm_inst._name, 'mac': vif['address'],
-                           'network': vif['network']['label'],
-                           'vdev': nic_vdev}, instance=instance)
-                self._networkop.create_nic(zhcpnode, zvm_inst._name,
-                                           vif['id'],
-                                           vif['address'],
-                                           nic_vdev)
-                nic_vdev = str(hex(int(nic_vdev, 16) + 3))[2:]
+            # Create xCAT node and userid for the instance
+            zvm_inst.create_xcat_node(zhcp)
+            zvm_inst.create_userid(block_device_info, image_meta, context,
+                                   deploy_image_name)
+
+            # Setup network for z/VM instance
+            self._preset_instance_network(zvm_inst._name, network_info)
+            self._add_nic_to_table(zvm_inst._name, network_info)
 
             # Call nodeset restapi to deploy image on node
             if not boot_from_volume:
-                deploy_image_name = self._zvm_images.get_imgname_xcat(
-                                        instance['image_ref'])
+                zvm_inst.update_node_info(image_meta)
                 zvm_inst.deploy_node(deploy_image_name, transportfiles)
             else:
                 zvmutils.punch_configdrive_file(transportfiles, zvm_inst._name)
 
-            # Change vm's admin password during spawn
-            zvmutils.punch_adminpass_file(instance_path, zvm_inst._name,
-                                          admin_password, linuxdist)
-
-            # Unlock the instance
-            zvmutils.punch_xcat_auth_file(instance_path, zvm_inst._name)
+            if 'image_comments' not in image_meta['properties']:
+                # Change vm's admin password during spawn
+                zvmutils.punch_adminpass_file(instance_path, zvm_inst._name,
+                                              admin_password, linuxdist)
+                # Unlock the instance
+                zvmutils.punch_xcat_auth_file(instance_path, zvm_inst._name)
+                if zvmutils.xcat_support_iucv(self._xcat_version):
+                    # Punch IUCV server files to reader.
+                    zvmutils.punch_iucv_file(os_version, zhcp, zhcp_userid,
+                                            zvm_inst._name, instance_path)
 
             # punch ephemeral disk info to the instance
             if instance['ephemeral_gb'] != 0:
@@ -437,12 +354,9 @@ class ZVMDriver(driver.ComputeDriver):
                         zvmutils.process_eph_disk(zvm_inst._name, vdev, fmt,
                                                   mount_dir)
 
-            # Wait until network configuration finish
-            self._wait_for_addnic(zvm_inst._name)
-            if not self._is_nic_granted(zvm_inst._name):
-                msg = _("Failed to bind vswitch")
-                LOG.error(msg, instance=instance)
-                raise exception.ZVMNetworkError(msg=msg)
+            # Wait neutron zvm-agent add NIC information
+            # to user direct.
+            self._wait_and_get_nic_direct(zvm_inst._name, instance)
 
             # Attach persistent volume, exclude root volume
             bdm_attach = list(bdm)
@@ -463,14 +377,14 @@ class ZVMDriver(driver.ComputeDriver):
             zvm_inst.power_on()
 
             # Update the root device name in instance table
-            root_device_name = '/dev/' + const.ZVM_DEFAULT_ROOT_VOLUME
+            root_device_name = '/dev/' + const.ZVM_DEFAULT_ROOT_DISK
             if boot_from_volume:
-                root_device_name = self._format_mountpoint(root_device_name)
+                root_device_name = root_mount_device
             instance.root_device_name = root_device_name
             instance.save()
 
             spawn_time = time.time() - spawn_start
-            LOG.info(_LI("Instance spawned succeeded in %s seconds") %
+            LOG.info(_LI("Instance spawned succeeded in %s seconds"),
                      spawn_time, instance=instance)
         except (exception.ZVMXCATCreateNodeFailed,
                 exception.ZVMImageError):
@@ -488,7 +402,7 @@ class ZVMDriver(driver.ComputeDriver):
             # Just a error log then re-raise
             with excutils.save_and_reraise_exception():
                 LOG.error(_("Deploy image to instance %(instance)s "
-                            "failed with reason: %(err)s") %
+                            "failed with reason: %(err)s"),
                           {'instance': zvm_inst._name, 'err': err},
                           instance=instance)
         finally:
@@ -498,8 +412,9 @@ class ZVMDriver(driver.ComputeDriver):
         if not boot_from_volume:
             self._zvm_images.update_last_use_date(deploy_image_name)
 
-    def _create_config_drive(self, instance_path, instance, injected_files,
-                             admin_password, commands, linuxdist):
+    def _create_config_drive(self, context, instance_path, instance,
+                             image_meta, injected_files, admin_password,
+                             commands, linuxdist):
         if CONF.config_drive_format not in ['tgz', 'iso9660']:
             msg = (_("Invalid config drive format %s") %
                    CONF.config_drive_format)
@@ -511,25 +426,29 @@ class ZVMDriver(driver.ComputeDriver):
         if CONF.zvm_config_drive_inject_password:
             extra_md['admin_pass'] = admin_password
 
-        udev_settle = linuxdist.get_znetconfig_contents()
-        if len(commands) == 0:
-            znetconfig = '\n'.join(('# !/bin/sh', udev_settle))
-        else:
-            znetconfig = '\n'.join(('# !/bin/sh', commands, udev_settle))
-        znetconfig += '\nrm -rf /tmp/znetconfig.sh\n'
-        # Create a temp file in instance to execute above commands
-        net_cmd_file = []
-        net_cmd_file.append(('/tmp/znetconfig.sh', znetconfig))
-        injected_files.extend(net_cmd_file)
-        # injected_files.extend(('/tmp/znetconfig.sh', znetconfig))
+        udev_settle = ''
+        if 'image_comments' not in image_meta['properties']:
+            udev_settle = linuxdist.get_znetconfig_contents()
+        if udev_settle:
+            if len(commands) == 0:
+                znetconfig = '\n'.join(('#!/bin/bash', udev_settle))
+            else:
+                znetconfig = '\n'.join(('#!/bin/bash', commands, udev_settle))
+            znetconfig += '\nrm -rf /tmp/znetconfig.sh\n'
+            # Create a temp file in instance to execute above commands
+            net_cmd_file = []
+            net_cmd_file.append(('/tmp/znetconfig.sh', znetconfig))  # nosec
+            injected_files.extend(net_cmd_file)
+            # injected_files.extend(('/tmp/znetconfig.sh', znetconfig))
 
         inst_md = instance_metadata.InstanceMetadata(instance,
                                                  content=injected_files,
-                                                 extra_md=extra_md)
+                                                 extra_md=extra_md,
+                                                 request_context=context)
 
         configdrive_tgz = os.path.join(instance_path, 'cfgdrive.tgz')
 
-        LOG.debug('Creating config drive at %s' % configdrive_tgz,
+        LOG.debug('Creating config drive at %s', configdrive_tgz,
                   instance=instance)
         with zvmconfigdrive.ZVMConfigDriveBuilder(instance_md=inst_md) as cdb:
             cdb.make_drive(configdrive_tgz)
@@ -538,13 +457,16 @@ class ZVMDriver(driver.ComputeDriver):
 
     def _preset_instance_network(self, instance_name, network_info):
         self._networkop.config_xcat_mac(instance_name)
-        LOG.debug("Add ip/host name on xCAT MN for instance %s" %
+        LOG.debug("Add ip/host name on xCAT MN for instance %s",
                     instance_name)
         try:
             network = network_info[0]['network']
             ip_addr = network['subnets'][0]['ips'][0]['address']
         except Exception:
-            msg = _("Invalid network info")
+            if network_info:
+                msg = _("Invalid network info: %s") % str(network_info)
+            else:
+                msg = _("Network info is Empty")
             raise exception.ZVMNetworkError(msg=msg)
 
         self._networkop.add_xcat_host(instance_name, ip_addr, instance_name)
@@ -560,7 +482,7 @@ class ZVMDriver(driver.ComputeDriver):
                                             bundle_file_path, disk_file)
 
         LOG.debug("Downloading the image %s from glance to nova compute "
-                    "server" % image_meta['id'], instance=instance)
+                    "server", image_meta['id'], instance=instance)
         self._zvm_images.fetch_image(context,
                                      image_meta['id'],
                                      image_file_path,
@@ -582,7 +504,7 @@ class ZVMDriver(driver.ComputeDriver):
             image_file_path = self._pathutils.get_img_path(
                 bundle_file_path, disk_file)
             LOG.debug("Downloading the image %s from glance to nova compute "
-                    "server" % image_meta['id'], instance=instance)
+                    "server", image_meta['id'], instance=instance)
             self._zvm_images.fetch_image(context,
                                      image_meta['id'],
                                      image_file_path,
@@ -594,16 +516,19 @@ class ZVMDriver(driver.ComputeDriver):
                 bundle_file_path, disk_file)
 
         LOG.debug("Generating the manifest.xml as a part of bundle file for "
-                    "image %s" % image_meta['id'], instance=instance)
+                    "image %s", image_meta['id'], instance=instance)
+        image_name = image_name.encode('unicode_escape')
+        image_name = image_name.replace('\u', '')
+        image_name = image_name.decode('utf-8')
         self._zvm_images.generate_manifest_file(image_meta, image_name,
                                                  disk_file, bundle_file_path)
 
-        LOG.debug("Generating bundle file for image %s" % image_meta['id'],
+        LOG.debug("Generating bundle file for image %s", image_meta['id'],
                   instance=instance)
         image_bundle_package = self._zvm_images.generate_image_bundle(
                                     spawn_path, tmp_f_fn, image_name)
 
-        LOG.debug("Importing the image %s to xCAT" % image_meta['id'],
+        LOG.debug("Importing the image %s to xCAT", image_meta['id'],
                   instance=instance)
         profile_str = image_name, instance['image_ref'].replace('-', '_')
         image_profile = '_'.join(profile_str)
@@ -636,11 +561,30 @@ class ZVMDriver(driver.ComputeDriver):
         inst_name = instance['name']
         root_mount_device, boot_from_volume = zvmutils.is_boot_from_volume(
                                                             block_device_info)
-        zvm_inst = ZVMInstance(instance)
+        zvm_inst = ZVMInstance(self, instance)
 
-        if self.instance_exists(inst_name):
-            LOG.info(_LI("Destroying instance %s") % inst_name,
+        if self._instance_exists(inst_name):
+            LOG.info(_LI("Destroying instance %s"), inst_name,
                      instance=instance)
+
+            # Collect diagnostics when the instance is unreachable, since this
+            # is most often caused by a deployment failure but the deployment
+            # artifacts are often needed to debug the root cause.
+            if zvm_inst.is_reachable():
+                LOG.debug(("Node %s is reachable, "
+                          "skipping diagnostics collection"), inst_name,
+                          instance=instance)
+            elif zvm_inst.is_powered_off():
+                LOG.debug(("Node %s is powered off, "
+                          "skipping diagnostics collection"), inst_name,
+                          instance=instance)
+            else:
+                LOG.debug(("Node %s is powered on but unreachable, "
+                          "collecting diagnostics for failed deployment"),
+                          inst_name,
+                          instance=instance)
+                zvm_inst.collect_diagnostics(context,
+                                    const.DIAGNOSTICS_RSN_DEPLOYMENT_TIMEOUT)
 
             bdm = driver.block_device_info_get_mapping(block_device_info)
             try:
@@ -652,7 +596,7 @@ class ZVMDriver(driver.ComputeDriver):
                     zvm_inst.clean_volume_boot(context, instance, bdm,
                                                root_mount_device)
             except exception.ZVMBaseException as err:
-                LOG.warn(_LW("Failed to detach volume: %s") %
+                LOG.warning(_LW("Failed to detach volume: %s"),
                          err.format_message(), instance=instance)
 
             if network_info:
@@ -660,13 +604,13 @@ class ZVMDriver(driver.ComputeDriver):
                     for vif in network_info:
                         self._networkop.clean_mac_switch_host(inst_name)
                 except exception.ZVMNetworkError:
-                    LOG.warn(_LW("Clean MAC and VSWITCH failed while "
-                                 "destroying z/VM instance %s") % inst_name,
+                    LOG.warning(_LW("Clean MAC and VSWITCH failed while "
+                                 "destroying z/VM instance %s"), inst_name,
                              instance=instance)
 
-            zvm_inst.delete_userid(self._get_hcp_info()['nodename'])
+            zvm_inst.delete_userid(self._get_hcp_info()['nodename'], context)
         else:
-            LOG.warn(_LW('Instance %s does not exist') % inst_name,
+            LOG.warning(_LW('Instance %s does not exist'), inst_name,
                      instance=instance)
 
     def manage_image_cache(self, context, filtered_instances):
@@ -694,14 +638,14 @@ class ZVMDriver(driver.ComputeDriver):
             encountered
 
         """
-        zvm_inst = ZVMInstance(instance)
+        zvm_inst = ZVMInstance(self, instance)
         if reboot_type == 'SOFT':
             zvm_inst.reboot()
         else:
             zvm_inst.reset()
 
         if not zvm_inst._reachable:
-            LOG.error(_("Failed to reboot instance %s: timeout") %
+            LOG.error(_("Failed to reboot instance %s: timeout"),
                       zvm_inst._name, instance=instance)
             raise nova_exception.InstanceRebootFailure(reason=_("timeout"))
 
@@ -741,10 +685,13 @@ class ZVMDriver(driver.ComputeDriver):
     def attach_volume(self, context, connection_info, instance, mountpoint,
                       disk_bus=None, device_type=None, encryption=None):
         """Attach the disk to the instance at mountpoint using info."""
+        if instance.vm_state == vm_states.PAUSED:
+            msg = _("Attaching to a paused instance is not supported.")
+            raise exception.ZVMDriverError(msg=msg)
         if mountpoint:
             mountpoint = self._format_mountpoint(mountpoint)
-        if self.instance_exists(instance['name']):
-            zvm_inst = ZVMInstance(instance)
+        if self._instance_exists(instance['name']):
+            zvm_inst = ZVMInstance(self, instance)
             is_active = zvm_inst.is_reachable()
 
             zvm_inst.attach_volume(self._volumeop, context, connection_info,
@@ -753,10 +700,13 @@ class ZVMDriver(driver.ComputeDriver):
     def detach_volume(self, connection_info, instance, mountpoint=None,
                       encryption=None):
         """Detach the disk attached to the instance."""
+        if instance.vm_state == vm_states.PAUSED:
+            msg = _("Detaching from a paused instance is not supported.")
+            raise exception.ZVMDriverError(msg=msg)
         if mountpoint:
             mountpoint = self._format_mountpoint(mountpoint)
-        if self.instance_exists(instance['name']):
-            zvm_inst = ZVMInstance(instance)
+        if self._instance_exists(instance['name']):
+            zvm_inst = ZVMInstance(self, instance)
             is_active = zvm_inst.is_reachable()
 
             zvm_inst.detach_volume(self._volumeop, connection_info, instance,
@@ -769,8 +719,8 @@ class ZVMDriver(driver.ComputeDriver):
             try:
                 self.power_on({}, instance, [])
             except nova_exception.InstancePowerOnFailure as err:
-                LOG.warn(_LW("Power On instance %(inst)s fail after capture, "
-                    "please check manually. The error is: %(err)s") %
+                LOG.warning(_LW("Power On instance %(inst)s fail after "
+                    "capture, please check manually. The error is: %(err)s"),
                     {'inst': instance['name'], 'err': err.format_message()},
                     instance=instance)
         if state == power_state.PAUSED:
@@ -779,8 +729,8 @@ class ZVMDriver(driver.ComputeDriver):
             except (exception.ZVMXCATRequestFailed,
                     exception.ZVMInvalidXCATResponseDataError,
                     exception.ZVMXCATInternalError) as err:
-                LOG.warn(_LW("Pause instance %(inst)s fail after capture, "
-                    "please check manually. The error is: %(err)s") %
+                LOG.warning(_LW("Pause instance %(inst)s fail after capture, "
+                    "please check manually. The error is: %(err)s"),
                     {'inst': instance['name'], 'err': err.format_message()},
                     instance=instance)
 
@@ -835,8 +785,9 @@ class ZVMDriver(driver.ComputeDriver):
             free_space_xcat = self._zvm_images.get_free_space_xcat(
                                   CONF.xcat_free_space_threshold,
                                   CONF.zvm_xcat_master)
+            user_dict = self._get_user_directory(instance['name'])
             imgcapture_needed = self._zvm_images.get_imgcapture_needed(
-                                    instance)
+                                    instance, user_dict)
             if (free_space_xcat - imgcapture_needed) < 0:
                 larger = max(CONF.xcat_free_space_threshold, imgcapture_needed)
                 size_needed = float(larger - free_space_xcat)
@@ -949,7 +900,8 @@ class ZVMDriver(driver.ComputeDriver):
                 image_service.update(context,
                                      image_href,
                                      new_image_meta,
-                                     image_file)
+                                     image_file,
+                                     purge_props=False)
         except Exception:
             with excutils.save_and_reraise_exception():
                 self._zvm_images.delete_image_glance(image_service, context,
@@ -964,29 +916,29 @@ class ZVMDriver(driver.ComputeDriver):
 
     def pause(self, instance):
         """Pause the specified instance."""
-        LOG.debug('Pausing %s' % instance['name'], instance=instance)
-        zvm_inst = ZVMInstance(instance)
+        LOG.debug('Pausing %s', instance['name'], instance=instance)
+        zvm_inst = ZVMInstance(self, instance)
         zvm_inst.pause()
 
     def unpause(self, instance):
         """Unpause paused VM instance."""
-        LOG.debug('Un-pausing %s' % instance['name'], instance=instance)
-        zvm_inst = ZVMInstance(instance)
+        LOG.debug('Un-pausing %s', instance['name'], instance=instance)
+        zvm_inst = ZVMInstance(self, instance)
         zvm_inst.unpause()
 
     def power_off(self, instance, timeout=0, retry_interval=0):
         """Power off the specified instance."""
-        LOG.debug('Stopping z/VM instance %s' % instance['name'],
+        LOG.debug('Stopping z/VM instance %s', instance['name'],
                   instance=instance)
-        zvm_inst = ZVMInstance(instance)
-        zvm_inst.power_off()
+        zvm_inst = ZVMInstance(self, instance)
+        zvm_inst.power_off(timeout, retry_interval)
 
     def power_on(self, context, instance, network_info,
                  block_device_info=None):
         """Power on the specified instance."""
-        LOG.debug('Starting z/VM instance %s' % instance['name'],
+        LOG.debug('Starting z/VM instance %s', instance['name'],
                   instance=instance)
-        zvm_inst = ZVMInstance(instance)
+        zvm_inst = ZVMInstance(self, instance)
         zvm_inst.power_on()
 
     def get_available_resource(self, nodename=None):
@@ -1001,7 +953,7 @@ class ZVMDriver(driver.ComputeDriver):
         :returns: Dictionary describing resources
 
         """
-        LOG.debug("Getting available resource for %s" % CONF.zvm_host)
+        LOG.debug("Getting available resource for %s", CONF.zvm_host)
         stats = self.update_host_status()[0]
 
         mem_used = stats['host_memory_total'] - stats['host_memory_free']
@@ -1018,7 +970,7 @@ class ZVMDriver(driver.ComputeDriver):
             'hypervisor_hostname': stats['hypervisor_hostname'],
             'cpu_info': jsonutils.dumps(stats['cpu_info']),
             'disk_available_least': stats['disk_available'],
-            'supported_instances': jsonutils.dumps(supported_instances),
+            'supported_instances': supported_instances,
             'numa_topology': None,
         }
 
@@ -1050,7 +1002,7 @@ class ZVMDriver(driver.ComputeDriver):
         return dest_check_data
 
     def check_can_live_migrate_source(self, ctxt, instance_ref,
-                                      dest_check_data):
+                                      dest_check_data, block_device_info=None):
         """Check if it is possible to execute live migration.
 
         This checks if the live migration can succeed, based on the
@@ -1061,7 +1013,7 @@ class ZVMDriver(driver.ComputeDriver):
         :param dest_check_data: result of check_can_live_migrate_destination
 
         """
-        LOG.info(_LI("Checking source host for live-migration for %s") %
+        LOG.info(_LI("Checking source host for live-migration for %s"),
                  instance_ref['name'], instance=instance_ref)
 
         migrate_data = dest_check_data.get('migrate_data', {})
@@ -1081,7 +1033,7 @@ class ZVMDriver(driver.ComputeDriver):
                         if '1944' in emsg:
                             # force domain/architecture in effect, ignore
                             return migrate_data
-                LOG.error(_("Live-migrating check failed: %s") % emsg,
+                LOG.error(_("Live-migrating check failed: %s"), emsg,
                           instance=instance_ref)
                 raise nova_exception.MigrationPreCheckError(reason=emsg)
 
@@ -1117,7 +1069,7 @@ class ZVMDriver(driver.ComputeDriver):
             LOG.error(msg, instance=instance_ref)
             raise nova_exception.MigrationError(reason=msg)
 
-        zvm_inst = ZVMInstance(instance_ref)
+        zvm_inst = ZVMInstance(self, instance_ref)
         source_xcat_mn = migrate_data.get('source_xcat_mn', '')
         userid = migrate_data.get('zvm_userid')
         hcp = self._get_hcp_info()['hostname']
@@ -1171,7 +1123,7 @@ class ZVMDriver(driver.ComputeDriver):
         """
         inst_name = instance_ref['name']
         dest_host = migrate_data['dest_host']
-        LOG.info(_LI("Live-migrating %(inst)s to %(dest)s") %
+        LOG.info(_LI("Live-migrating %(inst)s to %(dest)s"),
                  {'inst': inst_name, 'dest': dest_host}, instance=instance_ref)
 
         same_mn = migrate_data['pre_live_migration_result']['same_xcat_mn']
@@ -1186,7 +1138,7 @@ class ZVMDriver(driver.ComputeDriver):
         try:
             self._vmrelocate(dest_host, inst_name, 'move')
         except nova_exception.MigrationError as err:
-            LOG.error(_("Live-migration failed: %s") % err.format_message(),
+            LOG.error(_("Live-migration failed: %s"), err.format_message(),
                       instance=instance_ref)
             with excutils.save_and_reraise_exception():
                 recover_method(ctxt, instance_ref, dest,
@@ -1194,7 +1146,7 @@ class ZVMDriver(driver.ComputeDriver):
 
         if not same_mn:
             # Delete node definition at source xCAT MN
-            zvm_inst = ZVMInstance(instance_ref)
+            zvm_inst = ZVMInstance(self, instance_ref)
             self._networkop.clean_mac_switch_host(zvm_inst._name)
             zvm_inst.delete_xcat_node()
 
@@ -1214,12 +1166,12 @@ class ZVMDriver(driver.ComputeDriver):
 
         """
         inst_name = instance_ref['name']
-        nic_vdev = const.ZVM_DEFAULT_NIC_VDEV
+        nic_vdev = CONF.zvm_default_nic_vdev
         zhcp = self._get_hcp_info()['hostname']
 
         for vif in network_info:
             LOG.debug('Create nic for instance: %(inst)s, MAC: '
-                        '%(mac)s Network: %(network)s Vdev: %(vdev)s' %
+                        '%(mac)s Network: %(network)s Vdev: %(vdev)s',
                       {'inst': inst_name, 'mac': vif['address'],
                        'network': vif['network']['label'], 'vdev': nic_vdev},
                       instance=instance_ref)
@@ -1291,7 +1243,7 @@ class ZVMDriver(driver.ComputeDriver):
         manages several hypervisors, so will return a list of host
         status information.
         """
-        LOG.debug("Updating host status for %s" % CONF.zvm_host)
+        LOG.debug("Updating host status for %s", CONF.zvm_host)
 
         caps = []
         host = CONF.zvm_host
@@ -1314,7 +1266,7 @@ class ZVMDriver(driver.ComputeDriver):
         data['hypervisor_hostname'] = info['hypervisor_hostname']
         data['supported_instances'] = [(const.ARCHITECTURE,
                                         const.HYPERVISOR_TYPE,
-                                        vm_mode.HVM)]
+                                        fields.VMMode.HVM)]
         data['zhcp'] = self._get_hcp_info(info['zhcp'])
         data['ipl_time'] = info['ipl_time']
 
@@ -1363,7 +1315,7 @@ class ZVMDriver(driver.ComputeDriver):
 
         host_info = {}
 
-        with zvmutils.expect_invalid_xcat_resp_data():
+        with zvmutils.expect_invalid_xcat_resp_data(inv_info):
             host_info['vcpus'] = int(inv_info['lpar_cpu_total'])
             host_info['vcpus_used'] = int(inv_info['lpar_cpu_used'])
             host_info['cpu_info'] = {}
@@ -1395,8 +1347,8 @@ class ZVMDriver(driver.ComputeDriver):
         dp_keys = const.XCAT_DISKPOOL_KEYWORDS
         dp_info = zvmutils.translate_xcat_resp(dp_info_raw[0], dp_keys)
 
-        with zvmutils.expect_invalid_xcat_resp_data():
-            for k in dp_info.keys():
+        with zvmutils.expect_invalid_xcat_resp_data(dp_info):
+            for k in list(dp_info.keys()):
                 s = dp_info[k].strip().upper()
                 if s.endswith('G'):
                     sl = s[:-1].split('.')
@@ -1413,7 +1365,7 @@ class ZVMDriver(driver.ComputeDriver):
                 else:
                     exp = "ending with a 'G' or 'M'"
                     errmsg = _("Invalid diskpool size format: %(invalid)s; "
-                        "Expected: %(exp)s") % {'invalid': s, 'exp': exp}
+                        "Expected: %(exp)s"), {'invalid': s, 'exp': exp}
                     LOG.error(errmsg)
                     raise exception.ZVMDriverError(msg=errmsg)
 
@@ -1458,7 +1410,7 @@ class ZVMDriver(driver.ComputeDriver):
             self.unpause(instance)
 
         inst_name = instance['name']
-        LOG.debug("Starting to migrate instance %s" % inst_name,
+        LOG.debug("Starting to migrate instance %s", inst_name,
                   instance=instance)
 
         disk_owner = zvmutils.get_userid(inst_name)
@@ -1508,7 +1460,7 @@ class ZVMDriver(driver.ComputeDriver):
                          not mdisk.__contains__(exl))]
 
         eph_disk_info = []
-        with zvmutils.expect_invalid_xcat_resp_data():
+        with zvmutils.expect_invalid_xcat_resp_data(eph_disks):
             for eph in eph_disks:
                 eph_l = eph.rpartition(" MDISK ")[2].split(' ')
                 eph_disk_info.append({'vdev': eph_l[0],
@@ -1526,20 +1478,23 @@ class ZVMDriver(driver.ComputeDriver):
             if mountpoint:
                 mountpoint = self._format_mountpoint(mountpoint)
 
-            if self.instance_exists(instance['name']):
-                zvm_inst = ZVMInstance(instance)
+            if self._instance_exists(instance['name']):
+                zvm_inst = ZVMInstance(self, instance)
                 is_active = zvm_inst.is_reachable()
                 try:
                     zvm_inst.detach_volume(self._volumeop, connection_info,
                                            instance, mountpoint, is_active,
                                            rollback=False)
-                except exception.ZVMVolumeError:
-                    LOG.warn(_LW("Failed to detach volume from %s") %
-                             instance['name'], instance=instance)
+                except exception.ZVMVolumeError as err:
+                    LOG.warning(_LW("Failed to detach volume from %(inst)s: "
+                                    "%(err)s"),
+                                    {'inst': instance['name'],
+                                     'err': err.format_message()},
+                                    instance=instance)
 
     def _capture_disk_for_instance(self, context, instance):
         """Capture disk."""
-        zvm_inst = ZVMInstance(instance)
+        zvm_inst = ZVMInstance(self, instance)
         image_name = ''.join('rsz' + instance['name'])
         image_uuid = str(uuid.uuid4())
         image_href = image_uuid.replace('-', '_')
@@ -1580,6 +1535,12 @@ class ZVMDriver(driver.ComputeDriver):
                            defines the image from which this instance
                            was created
         """
+        # This is because commit fbe31e461ac3f16edb795993558a2314b4c16b52
+        # changes the image_meta from dict to object, we have several
+        # unique property can't be handled well
+        # see bug 1537921 for detail info
+        image_meta = self._image_api.get(context, image_meta.id)
+
         disk_info = jsonutils.loads(disk_info)
 
         source_xcat_mn = disk_info['disk_source_mn'].encode('gbk')
@@ -1591,9 +1552,18 @@ class ZVMDriver(driver.ComputeDriver):
         eph_disk_info = disk_info['eph_disk_info']
         shared_image_repo = disk_info['shared_image_repo']
 
+        old_eph_info = block_device_info['ephemerals']
+        new_eph_info = [eph for eph in eph_disk_info
+                            if eph['vdev'] != CONF.zvm_user_adde_vdev]
+
         block_device_info = block_device_info or {}
-        block_device_info['ephemerals'] = [eph for eph in eph_disk_info
-            if eph['vdev'] != CONF.zvm_user_adde_vdev]
+        block_device_info['ephemerals'] = new_eph_info
+
+        if (len(old_eph_info) == 1 and
+                old_eph_info[0]['size'] == disk_eph_size_old):
+            # Enlarge the only ephemeral disk
+            block_device_info['ephemerals'][0]['size'] = disk_eph_size_new
+            block_device_info['ephemerals'][0]['size_in_units'] = False
 
         old_userid = disk_info['disk_owner'].encode('gbk')
         new_userid = None
@@ -1606,7 +1576,9 @@ class ZVMDriver(driver.ComputeDriver):
         if disk_type != CONF.zvm_diskpool_type:
             if same_xcat_mn:
                 self._zvm_images.delete_image_from_xcat(image_name_xcat)
-            msg = _("Can not migration between different disk type")
+            msg = _("Can not migration between different disk type"
+                    "current is %(c)s, target is %(t)s") % {'t': disk_type,
+                    'c': CONF.zvm_diskpool_type}
             LOG.error(msg, instance=instance)
             raise nova_exception.MigrationError(reason=msg)
 
@@ -1618,9 +1590,11 @@ class ZVMDriver(driver.ComputeDriver):
 
         same_os = local_ip == source_ip
 
-        zhcp = self._get_hcp_info()['hostname']
+        hcp_info = self._get_hcp_info()
+        zhcp = hcp_info['hostname']
+        zhcp_userid = hcp_info['userid']
 
-        new_inst = ZVMInstance(instance)
+        new_inst = ZVMInstance(self, instance)
         instance_path = self._pathutils.get_instance_path(
                             CONF.zvm_host, new_inst._name)
         if same_xcat_mn:
@@ -1640,7 +1614,7 @@ class ZVMDriver(driver.ComputeDriver):
             # Create a xCAT node poin
             old_instance = self._copy_instance(instance)
             old_instance['name'] = ''.join(('rsz', instance['name']))
-            old_inst = ZVMInstance(old_instance)
+            old_inst = ZVMInstance(self, old_instance)
 
             with self.cleanup_xcat_image_for_migration(image_name_xcat):
                 old_inst.copy_xcat_node(new_inst._name)
@@ -1681,15 +1655,16 @@ class ZVMDriver(driver.ComputeDriver):
         try:
             # Pre-config network and create zvm userid
             self._preset_instance_network(new_inst._name, network_info)
-            new_inst.create_userid(block_device_info, image_meta)
+            new_inst.create_userid(block_device_info, image_meta, context)
 
             if disk_eph_size_old == 0 and disk_eph_size_new > 0:
                 # Punch ephemeral disk info to the new instance
                 zvmutils.process_eph_disk(new_inst._name)
 
             # Add nic and deploy the image
-            self._add_nic_to_instance(new_inst._name, network_info, new_userid)
+            self._add_nic_to_table(new_inst._name, network_info)
             self._deploy_root_and_ephemeral(new_inst, image_name_xcat)
+            self._wait_and_get_nic_direct(new_inst._name, instance)
         except exception.ZVMBaseException:
             with excutils.save_and_reraise_exception():
                 self._zvm_images.delete_image_from_xcat(image_name_xcat)
@@ -1701,9 +1676,10 @@ class ZVMDriver(driver.ComputeDriver):
                                 new_inst._name)
                     except exception.ZVMNetworkError as e:
                         emsg = zvmutils.format_exception_msg(e)
-                        LOG.debug('clean_mac_switch_host error: %s' % emsg)
+                        LOG.debug('clean_mac_switch_host error: %s', emsg)
 
-                new_inst.delete_userid(self._get_hcp_info()['nodename'])
+                new_inst.delete_userid(self._get_hcp_info()['nodename'],
+                                       context)
                 new_inst.delete_xcat_node()
 
                 if same_xcat_mn:
@@ -1712,14 +1688,9 @@ class ZVMDriver(driver.ComputeDriver):
 
                     # re-configure the networking
                     self._reconfigure_networking(new_inst._name, network_info,
-                                                 old_userid)
-
-                    if not self._is_nic_granted(new_inst._name):
-                        msg = _LW("Failed to bind vswitch")
-                        LOG.warn(msg, instance=instance)
-                    else:
-                        if power_on:
-                            new_inst.power_on()
+                                                 instance, userid=old_userid)
+                    if power_on:
+                        new_inst.power_on()
 
         # Cleanup image from xCAT image repository
         self._zvm_images.delete_image_from_xcat(image_name_xcat)
@@ -1727,6 +1698,13 @@ class ZVMDriver(driver.ComputeDriver):
         bdm = driver.block_device_info_get_mapping(block_device_info)
         try:
             zvmutils.punch_xcat_auth_file(instance_path, new_inst._name)
+            if zvmutils.xcat_support_iucv(self._xcat_version):
+                if same_xcat_mn:
+                    zvmutils.punch_iucv_authorized_file(old_inst._name,
+                                            new_inst._name, zhcp_userid)
+                else:
+                    zvmutils.punch_iucv_authorized_file(new_inst._name,
+                                            new_inst._name, zhcp_userid)
             new_inst.power_on()
             self._attach_volume_to_instance(context, instance, bdm)
 
@@ -1740,22 +1718,14 @@ class ZVMDriver(driver.ComputeDriver):
                     new_inst.copy_xcat_node(old_inst._name)
                     old_inst.delete_xcat_node()
 
-    def _reconfigure_networking(self, inst_name, network_info, userid=None):
+    def _reconfigure_networking(self, inst_name, network_info, instance,
+                                userid=None):
         self._preset_instance_network(inst_name, network_info)
-        self._add_nic_to_instance(inst_name, network_info, userid)
-        self._wait_for_nic_update(inst_name)
-        self._wait_for_addnic(inst_name)
+        self._add_nic_to_table(inst_name, network_info)
+        self._wait_and_get_nic_direct(inst_name, instance)
 
     def _copy_instance(self, instance):
-        keys = ('name', 'image_ref', 'uuid', 'user_id', 'project_id',
-                'power_state', 'system_metadata', 'memory_mb', 'vcpus',
-                'root_gb', 'ephemeral_gb')
-
-        inst_copy = {}
-        for key in keys:
-            inst_copy[key] = instance[key]
-
-        return inst_copy
+        return zvminstance.CopiedInstance(instance)
 
     def _attach_volume_to_instance(self, context, instance,
                                    block_device_mapping):
@@ -1764,12 +1734,20 @@ class ZVMDriver(driver.ComputeDriver):
             mountpoint = bd['mount_device']
             self.attach_volume(context, connection_info, instance, mountpoint)
 
-    def _add_nic_to_instance(self, inst_name, network_info, userid=None):
-        nic_vdev = const.ZVM_DEFAULT_NIC_VDEV
+    def _add_nic_to_table(self, inst_name, network_info):
+        nic_vdev = CONF.zvm_default_nic_vdev
         zhcpnode = self._get_hcp_info()['nodename']
         for vif in network_info:
-            self._networkop.create_nic(zhcpnode, inst_name,
-                vif['id'], vif['address'], nic_vdev, userid)
+            LOG.debug('Create xcat table value about nic: '
+                       'ID is %(id)s, address is %(address)s, '
+                        'vdev is %(vdev)s',
+                        {'id': vif['id'], 'address': vif['address'],
+                         'vdev': nic_vdev})
+            self._networkop.create_xcat_table_about_nic(zhcpnode,
+                                         inst_name,
+                                         vif['id'],
+                                         vif['address'],
+                                         nic_vdev)
             nic_vdev = str(hex(int(nic_vdev, 16) + 3))[2:]
 
     def _deploy_root_and_ephemeral(self, instance, image_name_xcat):
@@ -1782,19 +1760,19 @@ class ZVMDriver(driver.ComputeDriver):
 
         self._zvm_images.update_last_use_date(image_name_xcat)
 
-    def confirm_migration(self, migration, instance, network_info):
+    def confirm_migration(self, context, migration, instance, network_info):
         """Confirms a resize, destroying the source VM."""
         # Point to old instance
         old_instance = self._copy_instance(instance)
         old_instance['name'] = ''.join(('rsz', instance['name']))
-        old_inst = ZVMInstance(old_instance)
+        old_inst = ZVMInstance(self, old_instance)
 
-        if self.instance_exists(old_inst._name):
+        if self._instance_exists(old_inst._name):
             # Same xCAT MN:
-            self.destroy({}, old_instance)
+            self.destroy(context, old_instance)
         else:
             # Different xCAT MN:
-            self.destroy({}, instance)
+            self.destroy(context, instance)
             self._zvm_images.cleanup_image_after_migration(instance['name'])
 
     def finish_revert_migration(self, context, instance, network_info,
@@ -1802,21 +1780,19 @@ class ZVMDriver(driver.ComputeDriver):
         """Finish reverting a resize, powering back on the instance."""
         new_instance = self._copy_instance(instance)
         new_instance['name'] = ''.join(('rsz', instance['name']))
-        zvm_inst = ZVMInstance(new_instance)
+        zvm_inst = ZVMInstance(self, new_instance)
         bdm = driver.block_device_info_get_mapping(block_device_info)
 
-        if self.instance_exists(zvm_inst._name):
+        if self._instance_exists(zvm_inst._name):
             # Same xCAT MN:
-            old_inst = ZVMInstance(instance)
+            old_inst = ZVMInstance(self, instance)
             old_inst.copy_xcat_node(new_instance['name'])
+            if zvmutils.xcat_support_iucv(self._xcat_version):
+                zvmutils.add_iucv_in_zvm_table(instance['name'])
             zvm_inst.delete_xcat_node()
 
-            self._reconfigure_networking(instance['name'], network_info)
-
-            if not self._is_nic_granted(instance['name']):
-                msg = _("Failed to bind vswitch")
-                LOG.error(msg, instance=instance)
-                raise nova_exception.MigrationError(reason=msg)
+            self._reconfigure_networking(instance['name'], network_info,
+                                         instance)
         else:
             # Different xCAT MN:
             self._zvm_images.cleanup_image_after_migration(instance['name'])
@@ -1826,49 +1802,30 @@ class ZVMDriver(driver.ComputeDriver):
         if power_on:
             self.power_on({}, instance, [])
 
-    def _wait_for_addnic(self, inst_name):
-        """Wait until quantum adding NIC done."""
+    def _get_nic_switch_info(self, inst_name):
+        url = self._xcat_url.tabdump("/switch")
+        with zvmutils.expect_invalid_xcat_resp_data():
+            switch_info = zvmutils.xcat_request("GET", url)['data'][0]
+            switch_info.pop(0)
+            switch_dict = {}
+            for item in switch_info:
+                switch_list = item.split(',')
+                if switch_list[0].strip('"') == inst_name:
+                    switch_dict[switch_list[4].strip('"')] = \
+                                            switch_list[1].strip('"')
 
-        def _wait_addnic(inst_name, expiration):
-            if (CONF.zvm_reachable_timeout and
-                    timeutils.utcnow() > expiration):
-                raise loopingcall.LoopingCallDone()
-
-            is_done = False
-            try:
-                is_done = self._is_nic_granted(inst_name)
-            except exception.ZVMBaseException:
-                # Ignore any zvm driver exceptions
-                return
-
-            if is_done:
-                LOG.debug("NIC added and granted to vswitch correctly")
-                raise loopingcall.LoopingCallDone()
-
-        expiration = timeutils.utcnow() + datetime.timedelta(
-                         seconds=CONF.zvm_reachable_timeout)
-
-        timer = loopingcall.FixedIntervalLoopingCall(_wait_addnic, inst_name,
-                                                     expiration)
-        timer.start(interval=10).wait()
+            LOG.debug("Switch info the %(inst_name)s is %(switch_dict)s",
+                        {"inst_name": inst_name, "switch_dict": switch_dict})
+            return switch_dict
 
     def _get_user_directory(self, inst_name):
         url = self._xcat_url.lsvm('/' + inst_name)
-        with zvmutils.expect_invalid_xcat_resp_data():
-            dict_str = zvmutils.xcat_request("GET", url)['info'][0][0]
+        user_dict = zvmutils.xcat_request("GET", url)
+
+        with zvmutils.expect_invalid_xcat_resp_data(user_dict):
+            dict_str = user_dict['info'][0][0]
 
         return dict_str.split("\n")
-
-    def _is_nic_granted(self, inst_name):
-        dict_list = self._get_user_directory(inst_name)
-        _all_granted = False
-        for rec in dict_list:
-            if " NICDEF " in rec:
-                _all_granted = " LAN SYSTEM " in rec
-                if not _all_granted:
-                    return False
-
-        return _all_granted
 
     def set_admin_password(self, instance, new_pass=None):
         """Set the root password on the specified instance.
@@ -1881,58 +1838,67 @@ class ZVMDriver(driver.ComputeDriver):
             self._set_admin_password(instance['name'], new_pass)
 
     def _set_admin_password(self, inst_name, password):
-        command = "echo %s|passwd --stdin root" % password
+        command = "echo 'root:%s' | chpasswd" % password
         try:
-            zvmutils.xdsh(inst_name, command)
+            if zvmutils.xcat_support_iucv(self._xcat_version):
+                # After support IUCV, will use execcmdonvm to replace xdsh.
+                zvmutils.execcmdonvm(inst_name, command)
+            else:
+                zvmutils.xdsh(inst_name, command)
         except exception.ZVMXCATXdshFailed as err:
             LOG.error(_("Setting root password for instance %(instance)s "
-                        "failed with reason: %(err)s") %
+                        "failed with reason: %(err)s"),
                       {'instance': inst_name, 'err': err.format_message()})
             raise err
 
-    def _wait_for_nic_update(self, inst_name):
-        """Wait until NIC definition is updated."""
-
-        def _wait_revoke(inst_name, expiration):
-            """Wait until NIC is uncoupled from vswitch."""
+    def _wait_and_get_nic_direct(self, inst_name, instance):
+        """Wait until neutron zvm-agent add NICs into user direct done."""
+        def _wait_for_nic_add_in_direct(inst_name, expiration):
             if (CONF.zvm_reachable_timeout and
                     timeutils.utcnow() > expiration):
-                LOG.warn(_LW("NIC update check failed."))
-                raise loopingcall.LoopingCallDone()
+                msg = _("NIC update check failed "
+                        "on instance:%s") % instance.uuid
+                raise exception.ZVMNetworkError(msg=msg)
 
-            is_granted = True
             try:
-                is_granted = self._is_nic_granted(inst_name)
-            except exception.ZVMBaseException:
+                switch_dict = self._get_nic_switch_info(inst_name)
+                if switch_dict and '' not in switch_dict.values():
+                    for key, value in switch_dict.items():
+                        args = '&checknics=' + key
+                        url = self._xcat_url.lsvm('/' + inst_name)
+                        url = url + args
+                        res_info = zvmutils.xcat_request("GET", url)
+                        with zvmutils.expect_invalid_xcat_resp_data(res_info):
+                            if ("errorcode" in res_info and
+                                (len(res_info["errorcode"]) > 0) and
+                                res_info["errorcode"][0] != '0'):
+                                # we didn't found the definition
+                                return
+                else:
+                    # in this case, the nic switch info is not ready yet
+                    # need another loop to check until time out or find it
+                    return
+
+            except exception.ZVMBaseException as e:
                 # Ignore any zvm driver exceptions
+                LOG.info(_LI('encounter error %s during get vswitch info'),
+                         e.format_message(), instance=instance)
                 return
 
-            if not is_granted:
-                LOG.debug("NIC has been updated")
-                raise loopingcall.LoopingCallDone()
+            # Enter here means all NIC granted
+            LOG.info(_LI("All NICs are added in user direct for "
+                         "instance %s."), inst_name, instance=instance)
+            raise loopingcall.LoopingCallDone()
 
         expiration = timeutils.utcnow() + datetime.timedelta(
-                         seconds=CONF.zvm_reachable_timeout)
-
-        timer = loopingcall.FixedIntervalLoopingCall(_wait_revoke, inst_name,
-                                                     expiration)
+                             seconds=CONF.zvm_reachable_timeout)
+        LOG.info(_LI("Wait neturon-zvm-agent to add NICs to %s user direct."),
+                 inst_name, instance=instance)
+        timer = loopingcall.FixedIntervalLoopingCall(
+                    _wait_for_nic_add_in_direct, inst_name, expiration)
         timer.start(interval=10).wait()
 
-        return
-
     def get_console_output(self, context, instance):
-        # Because bug 534, in Juno, xcat will make new instance punch
-        # console logs to ZHCP and it violate the current RACF setting
-        # plus we don't announce support this feature, temply disable it
-        # until we can solve that RACF issue.
-        # in nova/api/openstack/compute/contrib/console_output.py
-        # it will catch the exception like:
-        # except NotImplementedError:
-        #   msg = _("Unable to get console log, functionality not implemented")
-        #   raise webob.exc.HTTPNotImplemented(explanation=msg)
-        raise NotImplementedError
-
-    def _get_console_output(self, context, instance):
         """Get console output for an instance."""
 
         def append_to_log(log_data, log_path):
@@ -1940,18 +1906,21 @@ class ZVMDriver(driver.ComputeDriver):
                          {'log_data': log_data, 'log_path': log_path})
             fp = open(log_path, 'a+')
             fp.write(log_data)
+            fp.close()
             return log_path
 
-        zvm_inst = ZVMInstance(instance)
+        zvm_inst = ZVMInstance(self, instance)
         logsize = CONF.zvm_console_log_size * units.Ki
         console_log = ""
+
         try:
             console_log = zvm_inst.get_console_log(logsize)
         except exception.ZVMXCATInternalError:
             # Ignore no console log avaiable error
-            LOG.warn(_LW("No new console log avaiable."))
+            LOG.info(_LI("No new console log avaiable."))
         log_path = self._pathutils.get_console_log_path(CONF.zvm_host,
                        zvm_inst._name)
+        # TODO(jichenjc): need consider shrink log file size
         append_to_log(console_log, log_path)
 
         log_fp = file(log_path, 'rb')
@@ -1962,9 +1931,9 @@ class ZVMDriver(driver.ComputeDriver):
 
         return log_data
 
-    def get_host_uptime(self, host_name):
+    def get_host_uptime(self):
         """Get host uptime."""
-        with zvmutils.expect_invalid_xcat_resp_data():
+        with zvmutils.expect_invalid_xcat_resp_data(self._host_stats):
             return self._host_stats[0]['ipl_time']
 
     def get_available_nodes(self, refresh=False):
@@ -1978,7 +1947,8 @@ class ZVMDriver(driver.ComputeDriver):
             if is_root:
                 return bd['connection_info']['serial']
 
-        errmsg = _("Failed to extract volume id from block device mapping.")
+        errmsg = _("Failed to extract volume id from block device mapping."
+                   "%s") % str(bdm)
         raise exception.ZVMDriverError(msg=errmsg)
 
     def _exclude_root_volume_bdm(self, bdm, root_mount_device):
@@ -1988,3 +1958,48 @@ class ZVMDriver(driver.ComputeDriver):
             if is_root:
                 bdm.remove(bd)
         return bdm
+
+    def _get_xcat_version(self):
+        url = self._xcat_url.version()
+        version_info = zvmutils.xcat_request("GET", url)
+        with zvmutils.expect_invalid_xcat_resp_data(version_info):
+            dict_str = version_info['data'][0][0]
+            version = dict_str.split()[1]
+        return version
+
+    def _version_check(self, req_ver=None, op=operator.lt):
+        try:
+            if req_ver is not None:
+                cur = versionutils.convert_version_to_int(self._xcat_version)
+                req = versionutils.convert_version_to_int(req_ver)
+                if op(cur, req):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def has_min_version(self, req_ver=None):
+        return self._version_check(req_ver=req_ver, op=operator.lt)
+
+    def has_version(self, req_ver=None):
+        return self._version_check(req_ver=req_ver, op=operator.ne)
+
+    def default_device_names_for_instance(self, instance, root_device_name,
+                                          *block_device_lists):
+        """Generate missing device names for an instance.
+           Default are /dev/vdN.
+        """
+        compute_utils.default_device_names_for_instance(
+            instance, root_device_name, *block_device_lists)
+        for bdm in itertools.chain(*block_device_lists):
+            bdm.device_name = self._format_mountpoint(bdm.device_name)
+            bdm.save()
+
+    def get_device_name_for_instance(self, instance, bdms, block_device_obj):
+        """Validates (or generates) a device name for instance.
+           Default are /dev/vdN.
+        """
+        device_name = block_device_obj.get("device_name")
+        device_name = compute_utils.get_device_name_for_instance(
+                                        instance, bdms, device_name)
+        return self._format_mountpoint(device_name)
